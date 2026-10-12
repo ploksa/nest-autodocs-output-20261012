@@ -1,0 +1,354 @@
+---
+title: "Testing Module and Builder Internals"
+sidebarTitle: "Testing"
+description: "How Nest testing utilities compile modules, override providers and enhancers, inject mock fallbacks, and bootstrap test apps and microservices."
+---
+
+The `@nestjs/testing` package provides the machinery for compiling a Nest application in a test harness. This page explains how `Test.createTestingModule`, `TestingModuleBuilder`, `TestingInjector`, and `TestingInstanceLoader` work together to let you override providers, guards, interceptors, pipes, and filters; mock unresolved dependencies; and spin up both HTTP and microservice test fixtures.
+
+### Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/testing/test.ts` | Static entry-point that instantiates `TestingModuleBuilder` |
+| `packages/testing/testing-module.builder.ts` | Holds user overrides, runs the scanner, and delegates instance creation |
+| `packages/testing/testing-module.ts` | Subclasses `NestApplicationContext`; exposes `createNestApplication` and `createNestMicroservice` |
+| `packages/testing/testing-injector.ts` | Subclasses `Injector` to add mocker-based fallback resolution |
+| `packages/testing/testing-instance-loader.ts` | Subclasses `InstanceLoader` to wire the `TestingInjector` with its mocker |
+| `packages/testing/interfaces/override-by.interface.ts` | Fluent API contract for override methods (`useValue`, `useFactory`, `useClass`) |
+| `packages/testing/interfaces/override-by-factory-options.interface.ts` | Factory options shape for `useFactory` overrides |
+| `packages/testing/interfaces/override-module.interface.ts` | Module replacement API contract (`useModule`) |
+| `packages/testing/interfaces/mock-factory.ts` | `MockFactory` type consumed by `useMocker` |
+
+## Starting a test module
+
+You begin every test setup with the static `Test` class:
+
+```ts packages/testing/test.ts
+export class Test {
+  private static readonly metadataScanner = new MetadataScanner();
+
+  public static createTestingModule(
+    metadata: ModuleMetadata,
+    options?: TestingModuleOptions,
+  ) {
+    return new TestingModuleBuilder(this.metadataScanner, metadata, options);
+  }
+}
+```
+
+`Test.createTestingModule` wraps the metadata you provide (the same shape as `@Module()`) in a dynamically created root module class, then hands it to a fresh `TestingModuleBuilder`. The builder owns a private `NestContainer` and an `ApplicationConfig` just like a real application.
+
+## Override API
+
+`TestingModuleBuilder` stores every override in an internal map. When you call `.overrideProvider('DATABASE_CONNECTION')`, you receive an `OverrideBy` object with three chainable methods:
+
+```ts packages/testing/interfaces/override-by.interface.ts
+export interface OverrideBy {
+  useValue: (value: any) => TestingModuleBuilder;
+  useFactory: (options: OverrideByFactoryOptions) => TestingModuleBuilder;
+  useClass: (metatype: any) => TestingModuleBuilder;
+}
+```
+
+The `OverrideBy` factory options accept a callable factory and an optional `inject` array:
+
+```ts packages/testing/interfaces/override-by-factory-options.interface.ts
+export interface OverrideByFactoryOptions {
+  factory: (...args: any[]) => any;
+  inject?: any[];
+}
+```
+
+The builder exposes symmetrical methods for each override kind:
+
+- `overrideProvider(typeOrToken)`   (flagged `isProvider: true`)
+- `overrideGuard(typeOrToken)`      (flagged `isProvider: false`)
+- `overrideInterceptor(typeOrToken)` (flagged `isProvider: false`)
+- `overridePipe(typeOrToken)`       (flagged `isProvider: false`)
+- `overrideFilter(typeOrToken)`     (flagged `isProvider: false`)
+
+All of them delegate to the private `override` method and store the result in `overloadsMap`:
+
+```ts packages/testing/testing-module.builder.ts
+  private override<T = any>(typeOrToken: T, isProvider: boolean): OverrideBy {
+    const addOverload = (options: any) => {
+      this.overloadsMap.set(typeOrToken, {
+        ...options,
+        isProvider,
+      });
+      return this;
+    };
+    return this.createOverrideByBuilder(addOverload);
+  }
+```
+
+### Overriding modules
+
+You can also replace an entire module reference during the scan phase:
+
+```ts packages/testing/testing-module.builder.ts
+  public overrideModule(moduleToOverride: ModuleDefinition): OverrideModule {
+    return {
+      useModule: newModule => {
+        this.moduleOverloadsMap.set(moduleToOverride, newModule);
+        return this;
+      },
+    };
+  }
+```
+
+Module overrides are passed to the `DependenciesScanner.scan` call via the `overrides` option.
+
+## Compilation flow
+
+<Steps>
+  <Step title="Create builder">
+    Constructor creates a `NestContainer`, wraps metadata in a synthetic root-module class, and stores both.
+  </Step>
+  <Step title="Apply logger">
+    `compile()` starts by calling `applyLogger()`. If you called `setLogger()`, that logger is used; otherwise a default `TestingLogger` is installed via `Logger.overrideLogger`.
+  </Step>
+  <Step title="Choose GraphInspector">
+    If `snapshot: true` is passed, a real `GraphInspector` is created and `UuidFactory` is switched to deterministic mode. Otherwise `NoopGraphInspector` (a Proxy that returns no-op functions for every method) is used.
+  </Step>
+  <Step title="Scan dependencies">
+    `DependenciesScanner.scan` walks imports, providers, controllers, and exports exactly as it does during normal bootstrap, but respecting module overrides.
+  </Step>
+  <Step title="Apply overloads">
+    `applyOverloadsMap()` iterates every entry and calls `container.replace(item, options)`, which swaps the provider or enhancer definition in the container before instances are created.
+  </Step>
+  <Step title="Create instances">
+    A `TestingInstanceLoader` paired with a `TestingInjector` resolves all constructor and property dependencies. If `useMocker(mockerFn)` was set, the injector falls back to the mocker when a dependency is missing.
+  </Step>
+  <Step title="Apply application providers">
+    `scanner.applyApplicationProviders()` registers any global enhancers and application-level providers declared in each module.
+  </Step>
+  <Step title="Return TestingModule">
+    After pre-loading lazy packages, a `TestingModule` instance is returned.
+  </Step>
+</Steps>
+
+The `compile` signature is:
+
+```ts packages/testing/testing-module.builder.ts
+  public async compile(
+    options: Pick<NestApplicationContextOptions, 'snapshot' | 'preview'> = {},
+  ): Promise<TestingModule> {
+    // ... steps above
+  }
+```
+
+## Creating applications and microservices
+
+`TestingModule` subclasses `NestApplicationContext`, so you already have `get`, `resolve`, `select`, `init`, and `close`. In addition it can materialize a real HTTP or microservice application from the compiled container:
+
+```ts packages/testing/testing-module.ts
+  public createNestApplication<T extends INestApplication = INestApplication>(
+    httpAdapter: HttpServer | AbstractHttpAdapter,
+    options?: NestApplicationOptions,
+  ): T;
+  public createNestApplication<T extends INestApplication = INestApplication>(
+    options?: NestApplicationOptions,
+  ): T;
+  public createNestApplication<T extends INestApplication = INestApplication>(
+    serverOrOptions:
+      | HttpServer
+      | AbstractHttpAdapter
+      | NestApplicationOptions
+      | undefined,
+    options?: NestApplicationOptions,
+  ): T {
+    const [httpAdapter, appOptions] = this.isHttpServer(serverOrOptions)
+      ? [serverOrOptions, options]
+      : [this.createHttpAdapter(), serverOrOptions];
+
+    this.applyLogger(appOptions);
+    this.container.setHttpAdapter(httpAdapter);
+
+    const instance = new NestApplication(
+      this.container,
+      httpAdapter,
+      this.applicationConfig,
+      this.graphInspector,
+      appOptions,
+    );
+    return this.createAdapterProxy<T>(instance, httpAdapter);
+  }
+```
+
+If you do not pass an explicit adapter, `createHttpAdapter()` lazily loads `ExpressAdapter` from `@nestjs/platform-express`. The returned object is a Proxy that forwards unknown property accesses to the underlying adapter, so methods like `request` or `getHttpServer` are available transparently.
+
+Microservices work the same way by loading `NestMicroservice` from `@nestjs/microservices`:
+
+```ts packages/testing/testing-module.ts
+  public createNestMicroservice<T extends object>(
+    options: NestMicroserviceOptions & T,
+  ): INestMicroservice {
+    const { NestMicroservice } = loadPackageCached('@nestjs/microservices', ...);
+    return new NestMicroservice(
+      this.container,
+      options,
+      this.graphInspector,
+      this.applicationConfig,
+    );
+  }
+```
+
+## TestingInjector and mocker fallback
+
+`TestingInjector` subclasses the core `Injector` and overrides two resolution methods:
+
+```ts packages/testing/testing-injector.ts
+export class TestingInjector extends Injector {
+  protected mocker?: MockFactory;
+  protected container: NestContainer;
+
+  public async resolveComponentWrapper<T>(
+    moduleRef: Module,
+    name: any,
+    dependencyContext: InjectorDependencyContext,
+    wrapper: InstanceWrapper<T>,
+    resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+    keyOrIndex?: string | number,
+  ): Promise<InstanceWrapper> {
+    try {
+      return await super.resolveComponentWrapper(
+        moduleRef,
+        name,
+        dependencyContext,
+        wrapper,
+        resolutionContext,
+        keyOrIndex,
+      );
+    } catch (err) {
+      return this.mockWrapper(err, moduleRef, name, wrapper);
+    }
+  }
+
+  public async resolveComponentHost<T>(
+    moduleRef: Module,
+    instanceWrapper: InstanceWrapper<T>,
+    resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+  ): Promise<InstanceWrapper> {
+    try {
+      return await super.resolveComponentHost(
+        moduleRef,
+        instanceWrapper,
+        resolutionContext,
+      );
+    } catch (err) {
+      return this.mockWrapper(
+        err,
+        moduleRef,
+        instanceWrapper.name,
+        instanceWrapper,
+      );
+    }
+  }
+}
+```
+
+Both methods try normal resolution first. On failure, they delegate to `mockWrapper`. If no mocker was configured, the original exception is rethrown. If there is a mocker, it is invoked with the missing token. When the mocker returns a truthy value, a new `InstanceWrapper` is created with `isResolved: true` and the mock instance is registered as a custom provider in the internal core module so it becomes available everywhere.
+
+`TestingInstanceLoader` is a thin subclass whose only job is to attach the container and mocker to the injector before calling the normal `createInstancesOfDependencies`:
+
+```ts packages/testing/testing-instance-loader.ts
+export class TestingInstanceLoader extends InstanceLoader<TestingInjector> {
+  public async createInstancesOfDependencies(
+    modules: Map<string, Module> = this.container.getModules(),
+    mocker?: MockFactory,
+  ): Promise<void> {
+    this.injector.setContainer(this.container);
+    mocker && this.injector.setMocker(mocker);
+    await super.createInstancesOfDependencies();
+  }
+}
+```
+
+## Usage examples
+
+### Overriding a provider
+
+```ts
+import { Test } from '@nestjs/testing';
+
+const moduleRef = await Test.createTestingModule({
+  providers: [{ provide: 'DATABASE', useValue: 'real-db' }],
+})
+  .overrideProvider('DATABASE')
+  .useValue('mock-db')
+  .compile();
+
+console.log(moduleRef.get('DATABASE')); // 'mock-db'
+```
+
+### Using a mocker for missing dependencies
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  providers: [NeedsMissingDep],
+})
+  .useMocker(token => {
+    if (token === MissingDepClass) {
+      return { mockValue: 'mocked' };
+    }
+    return null;
+  })
+  .compile();
+
+const instance = moduleRef.get(NeedsMissingDep);
+```
+
+This pattern is useful when some deep provider is irrelevant to the unit under test.
+
+### Overriding with a factory
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  providers: [CalculatorService],
+})
+  .overrideProvider('CALC_CONFIG')
+  .useFactory({
+    factory: () => ({ multiplier: 2 }),
+  })
+  .compile();
+```
+
+### Module replacement
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  imports: [ProductionModule],
+})
+  .overrideModule(ProductionModule)
+  .useModule(StubModule)
+  .compile();
+```
+
+### Building a Nest application from a test module
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  imports: [AppModule],
+}).compile();
+
+const app = moduleRef.createNestApplication();
+await app.init();
+```
+
+You can also pass a custom adapter:
+
+```ts
+const app = moduleRef.createNestApplication(myFastifyAdapter);
+```
+
+## Snapshots and preview mode
+
+Pass `snapshot: true` to `compile` to enable deterministic UUIDs and full graph inspection. Pass `preview: true` to suppress eager instance creation (the container is scanned but providers are not resolved until requested). Both options are passed to the `TestingInjector` constructor and stored on the bas and stored on the base `Injector`.
+
+## Related pages
+
+- [Injector resolution flow](/di/injector) for deep-dive on dependency resolution
+- [Dependency Scanner](/di/dependency-scanner) for how `DependenciesScanner` populates the container
+- [Modules and Container](/di/modules-and-container) for `NestContainer`, `Module`, and module tokens

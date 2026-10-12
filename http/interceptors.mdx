@@ -1,0 +1,353 @@
+---
+title: "Interceptor Chain and RxJS Defer Model"
+description: "How InterceptorsContextCreator resolves interceptors and InterceptorsConsumer chains them around the handler as an RxJS Observable with AsyncResource context."
+sidebarTitle: "Interceptors"
+---
+
+Interceptors in Nest wrap route handlers inside an Observable chain. They are the primary extension point for cross-cutting concerns like logging, caching, serialization, and timeout handling. This page explains how the framework resolves interceptor metadata from controllers and providers, then builds a nested chain of deferred Observables so that each interceptor can modify the request before it reaches the handler and transform the response after the handler completes.
+
+## The NestInterceptor Interface
+
+Every interceptor implements the `NestInterceptor` interface defined in `packages/common/interfaces/features/nest-interceptor.interface.ts`:
+
+```ts packages/common/interfaces/features/nest-interceptor.interface.ts
+export interface CallHandler<T = any> {
+  handle(): Observable<T>;
+}
+
+export interface NestInterceptor<T = any, R = any> {
+  intercept(
+    context: ExecutionContext,
+    next: CallHandler<T>,
+  ): Observable<R> | Promise<Observable<R>>;
+}
+```
+
+An interceptor receives an `ExecutionContext` and a `CallHandler` that represents the rest of the pipeline. Calling `next.handle()` returns an `Observable` of the route handler's eventual response. The interceptor can return a transformed Observable or a Promise that resolves to one.
+
+Interceptors are registered through `@UseInterceptors`, `app.useGlobalInterceptors()`, or the `APP_INTERCEPTOR` provider token.
+
+## Resolving Interceptors: InterceptorsContextCreator
+
+`InterceptorsContextCreator` lives in `packages/core/interceptors/interceptors-context-creator.ts` and follows the same pattern as guards and pipes. It extends `ContextCreator` and produces an ordered array of `NestInterceptor` instances.
+
+### Metadata Resolution
+
+The `create` method resolves interceptors for a specific controller method by merging global, controller, and method metadata in order.
+
+```ts packages/core/interceptors/interceptors-context-creator.ts
+export class InterceptorsContextCreator extends ContextCreator {
+  public create(
+    instance: Controller,
+    callback: (...args: unknown[]) => unknown,
+    module: string,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
+  ): NestInterceptor[] {
+    this.moduleContext = module;
+    return this.createContext(
+      instance,
+      callback,
+      INTERCEPTORS_METADATA,
+      contextId,
+      inquirerId,
+    );
+  }
+}
+```
+
+The metadata key is `INTERCEPTORS_METADATA`. Like guards, each level stores its own metadata array, and `createContext` concatenates them in global, class, method order.
+
+### Concrete Context Creation
+
+`createConcreteContext` instantiates interceptor classes from the module's injectable collection and filters the result for items that have a valid `intercept` function.
+
+```ts packages/core/interceptors/interceptors-context-creator.ts
+public createConcreteContext<T extends any[], R extends any[]>(
+  metadata: T,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): R {
+  if (isEmpty(metadata)) {
+    return [] as any[] as R;
+  }
+  return iterate(metadata)
+    .filter(
+      interceptor =>
+        interceptor && (interceptor.name || interceptor.intercept),
+    )
+    .map(
+      interceptor =>
+        this.getInterceptorInstance(interceptor, contextId, inquirerId)!,
+    )
+    .filter((interceptor: NestInterceptor) =>
+      interceptor ? isFunction(interceptor.intercept) : false,
+    )
+    .toArray() as R;
+}
+```
+
+`getInterceptorInstance` prefers an existing object with an `intercept` method. For plain classes, it looks up the injectable in the current module or returns null if the class is not found.
+
+### Scoped Global Interceptors
+
+Global interceptors are retrieved from `ApplicationConfig`. In a non-static context, request-scoped `APP_INTERCEPTOR` providers are also resolved, just like guards and pipes.
+
+```ts packages/core/interceptors/interceptors-context-creator.ts
+public getGlobalMetadata<T extends unknown[]>(
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): T {
+  if (!this.config) {
+    return [] as unknown[] as T;
+  }
+  const globalInterceptors = this.config.getGlobalInterceptors() as T;
+  if (contextId === STATIC_CONTEXT && !inquirerId) {
+    return globalInterceptors;
+  }
+  const scopedInterceptorWrappers =
+    this.config.getGlobalRequestInterceptors() as InstanceWrapper[];
+  const scopedInterceptors = iterate(scopedInterceptorWrappers)
+    .map(wrapper =>
+      wrapper.getInstanceByContextId(
+        this.getContextId(contextId, wrapper),
+        inquirerId,
+      ),
+    )
+    .filter(host => !!host)
+    .map(host => host.instance)
+    .toArray();
+  return globalInterceptors.concat(scopedInterceptors) as T;
+}
+```
+
+## Running the Interceptor Chain: InterceptorsConsumer
+
+`InterceptorsConsumer` in `packages/core/interceptors/interceptors-consumer.ts` is responsible for turning the array of resolved interceptors into a nested chain of Observable calls. It uses `defer` and `mergeAll` from RxJS so that each interceptor's `handle()` call lazily evaluates the next interceptor only when subscription occurs.
+
+### The Core Intercept Method
+
+```ts packages/core/interceptors/interceptors-consumer.ts
+export class InterceptorsConsumer {
+  public async intercept<TContext extends string = ContextType>(
+    interceptors: NestInterceptor[],
+    args: unknown[],
+    instance: Controller,
+    callback: (...args: unknown[]) => unknown,
+    next: () => Promise<unknown>,
+    type?: TContext,
+  ): Promise<unknown> {
+    if (!interceptors || isEmptyArray(interceptors)) {
+      return next();
+    }
+    const context = this.createContext(args, instance, callback);
+    context.setType<TContext>(type!);
+
+    const nextFn = async (i = 0) => {
+      if (i >= interceptors.length) {
+        return defer(AsyncResource.bind(() => this.transformDeferred(next)));
+      }
+      const handler: CallHandler = {
+        handle: () =>
+          defer(AsyncResource.bind(() => nextFn(i + 1))).pipe(mergeAll()),
+      };
+      return interceptors[i].intercept(context, handler);
+    };
+    return defer(() => nextFn()).pipe(mergeAll());
+  }
+}
+```
+
+When no interceptors are present, `intercept` returns the plain handler promise through `next()`, bypassing all Observable machinery.
+
+When interceptors exist, `nextFn` is called recursively to build a chain where each interceptor receives a `CallHandler` whose `handle()` method returns the defer-merged result of the next interceptor in the chain.
+
+### Defer, MergeAll, and the Observable Chain
+
+Each `CallHandler.handle()` call wraps the next interceptor in `defer(() => nextFn(i + 1)).pipe(mergeAll())`. This pattern ensures that:
+
+1. `defer` does not execute the factory function until the Observable is subscribed
+2. `mergeAll` subscribes to and flattens any inner Observable returned by the next interceptor
+3. The chain is lazy: interceptors are evaluated in subscription order, not at request time
+
+The final call returns the route handler wrapped in `transformDeferred`, which converts a plain Promise into an Observable that handles errors gracefully and checks whether the outer subscriber has already closed before proceeding.
+
+### transformDeferred
+
+`transformDeferred` is called inside the innermost `defer` when all interceptors have been traversed and it is time to run the actual route handler.
+
+```ts packages/core/interceptors/interceptors-consumer.ts
+public transformDeferred(next: () => Promise<any>): Observable<any> {
+  const nextPromise = next();
+  return new Observable(subscriber => {
+    let innerSub: { unsubscribe(): void } | undefined;
+
+    nextPromise
+      .then(res => {
+        if (subscriber.closed) {
+          return;
+        }
+        const isDeferred =
+          res instanceof Promise || res instanceof Observable;
+        innerSub = from(isDeferred ? res : Promise.resolve(res)).subscribe(
+          subscriber,
+        );
+      })
+      .catch(err => {
+        if (!subscriber.closed) {
+          subscriber.error(err);
+        }
+      });
+
+    return () => {
+      innerSub?.unsubscribe();
+    };
+  });
+}
+```
+
+`transformDeferred` eagerly calls `next()` but defers the emission until the Observable subscription context is active. This is important for preserving `AsyncLocalStorage` context through the asynchronous boundary.
+
+### AsyncResource Context Propagation
+
+The consumer uses `AsyncResource.bind` to preserve Node.js async context across the defer boundary:
+
+```ts packages/core/interceptors/interceptors-consumer.ts (excerpt)
+defer(AsyncResource.bind(() => this.transformDeferred(next)))
+```
+
+Without this, any `AsyncLocalStorage` or `AsyncResource` state set before the interceptor was invoked would be lost inside the route handler, because RxJS subscriber callbacks run outside the original async context. The binding causes the callback to execute within the captured async context.
+
+## RouterExecutionContext Wiring
+
+Inside `RouterExecutionContext.create`, interceptors are resolved after pipes and guards but before the final proxy is created. The interceptors array is passed into the proxy function where `InterceptorsConsumer.intercept` is called around the handler.
+
+```ts packages/core/router/router-execution-context.ts
+public create(
+  instance: Controller,
+  callback: (...args: any[]) => unknown,
+  methodName: string,
+  moduleKey: string,
+  // ...
+) {
+  const pipes = this.pipesContextCreator.create(...);
+  const guards = this.guardsContextCreator.create(...);
+  const interceptors = this.interceptorsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  // ...
+}
+```
+
+The interceptor chain wraps the entire request after guards have passed. Since interceptors receive an Observable, they can perform side effects before `next.handle()` and transform the response after subscribing to it.
+
+## Built-in Interceptors
+
+### ClassSerializerInterceptor
+
+**File:** `packages/common/serializer/class-serializer.interceptor.ts`
+
+`ClassSerializerInterceptor` is a built-in global interceptor that serializes response objects before they are sent to the client. It uses the `class-transformer` library under the hood and respects `@SerializeOptions` metadata set via decorators.
+
+```ts packages/common/serializer/class-serializer.interceptor.ts
+@Injectable()
+export class ClassSerializerInterceptor implements NestInterceptor {
+  constructor(
+    @Inject(REFLECTOR) protected readonly reflector: any,
+    @Optional()
+    protected readonly defaultOptions: ClassSerializerInterceptorOptions = {},
+  ) {}
+
+  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
+    const contextOptions = this.getContextOptions(context);
+    const options = { ...this.defaultOptions, ...contextOptions };
+    return next.handle().pipe(
+      map((res: PlainLiteralObject | Array<PlainLiteralObject>) =>
+        this.serialize(res, options),
+      ),
+    );
+  }
+}
+```
+
+The interceptor calls `next.handle()` first to get the handler's response Observable, then applies `map` to transform each value through `serialize`. `serialize` skips `StreamableFile` and non-object values, then runs `classToPlain` or `plainToInstance` based on whether a type override is configured.
+
+Context options are fetched from the `Reflector` using metadata keys `CLASS_SERIALIZER_OPTIONS`, which may be set with the `@SerializeOptions` decorator.
+
+### StandardSchemaSerializerInterceptor
+
+**File:** `packages/common/serializer/standard-schema-serializer.interceptor.ts`
+
+This interceptor serializes responses using a Standard Schema-compatible schema. It is intended for APIs built with schema-driven libraries and applies schema transformation within the Observable map operator.
+
+<Note>
+  The in-source package repository does not include a built-in cache interceptor. Cache interception is handled by the `@nestjs/cache-manager` package, which resolves its interceptor as an external concern rather than as part of `@nestjs/common`.
+</Note>
+
+## Example: A Logging Interceptor
+
+Below is a minimal interceptor that logs request and response timing. It follows the same `intercept` contract that `InterceptorsConsumer` expects.
+
+```ts
+import { Injectable, NestInterceptor, ExecutionContext, CallHandler } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { tap } from 'rxjs/operators';
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const className = context.getClass().name;
+    const handlerName = context.getHandler().name;
+    console.log(`Before ${className}.${handlerName}`);
+    const now = Date.now();
+
+    return next.handle().pipe(
+      tap(() => console.log(`After ${className}.${handlerName} ${Date.now() - now}ms`)),
+    );
+  }
+}
+```
+
+When applied to a route through `@UseInterceptors(LoggingInterceptor)`, `InterceptorsContextCreator.create` resolves the `LoggingInterceptor` instance, and `InterceptorsConsumer.intercept` builds a chain where each `CallHandler.handle()` call evaluates the next interceptor until `LoggingInterceptor` runs. Its `tap` operator fires after the route handler completes but before the response is sent.
+
+## Registration
+
+Interceptors are attached with the `@UseInterceptors` decorator in `packages/common/decorators/core/use-interceptors.decorator.ts`:
+
+```ts packages/common/decorators/core/use-interceptors.decorator.ts
+export function UseInterceptors(
+  ...interceptors: (NestInterceptor | Function)[]
+): MethodDecorator & ClassDecorator {
+  return (target, key, descriptor) => {
+    if (descriptor) {
+      extendArrayMetadata(
+        INTERCEPTORS_METADATA,
+        interceptors,
+        descriptor.value,
+      );
+      return descriptor;
+    }
+    extendArrayMetadata(INTERCEPTORS_METADATA, interceptors, target);
+    return target;
+  };
+}
+```
+
+Like guards and pipes, the framework stores interceptor metadata at the controller and method levels independently, then concatenates them in global, class, method order during resolution.
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/core/interceptors/interceptors-context-creator.ts` | Resolves interceptor metadata and creates concrete interceptor instances. |
+| `packages/core/interceptors/interceptors-consumer.ts` | Builds and executes the nested RxJS Observable chain for interceptors. |
+| `packages/common/interfaces/features/nest-interceptor.interface.ts` | Defines the `NestInterceptor` and `CallHandler` interfaces. |
+| `packages/common/decorators/core/use-interceptors.decorator.ts` | The `@UseInterceptors` decorator that stores interceptor metadata. |
+| `packages/common/serializer/class-serializer.interceptor.ts` | Built-in interceptor for transforming and serializing response objects with class-transformer. |
+| `packages/common/serializer/standard-schema-serializer.interceptor.ts` | Built-in interceptor for serializing responses using a Standard Schema-compatible schema. |
+
+## See Also
+
+- [Guards](/http/guards) for access control that runs before the interceptor chain
+- [Pipes](/http/pipes) for parameter transformation inside the interceptor-wrapped handler
+- [Exception Filters](/http/exception-filters) for how errors in interceptors are caught and mapped

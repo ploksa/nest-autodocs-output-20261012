@@ -1,0 +1,677 @@
+---
+title: "Microservices Layer, Transports and Message Flow"
+sidebarTitle: "Microservices"
+description: "Deep dive into Nest's microservices layer: NestMicroservice bootstrap, Server base, built-in transports, ClientProxy, RPC pipeline and hybrid apps."
+---
+
+Nest's microservices layer in `packages/microservices` lets you build message-driven and event-driven services. The architecture separates transport servers (`Server` subclasses) from client proxies (`ClientProxy` subclasses) with a common resolution pipeline that applies guards, pipes, interceptors and exception filters to RPC handlers. This page walks through the internal bootstrapping of a microservice, how pattern handlers are registered and how messages flow from the transport layer to your controller methods.
+
+## NestMicroservice Bootstrap
+
+`NestMicroservice` extends `NestApplicationContext` and is either created directly via `NestFactory.createMicroservice` or attached to an existing HTTP application as a hybrid microservice through `connectMicroservice`.
+
+### Construction and Server Creation
+
+The constructor receives the `NestContainer`, microservice configuration, `GraphInspector` and `ApplicationConfig`. It registers the `MicroservicesModule`, creates a server instance via `createServer`, selects the context module and adds that instance as an RPC target on the container.
+
+```ts packages/microservices/nest-microservice.ts
+export class NestMicroservice extends NestApplicationContext implements INestMicroservice {
+  constructor(
+    container: NestContainer,
+    config: CompleteMicroserviceOptions = {},
+    private readonly graphInspector: GraphInspector,
+    private readonly applicationConfig: ApplicationConfig,
+  ) {
+    super(container, config);
+    this.injector = new Injector({
+      preview: config.preview!,
+      instanceDecorator: config.instrument?.instanceDecorator,
+    });
+    this.microservicesModule.register(
+      container,
+      this.graphInspector,
+      this.applicationConfig,
+      this.appOptions,
+    );
+    this.createServer(config);
+    this.selectContextModule();
+    const modulesContainer = this.container.getModules();
+    modulesContainer.addRpcTarget(this.serverInstance);
+  }
+}
+```
+
+`createServer` resolves async strategies or delegates to `ServerFactory.create` based on the `Transport` enum. If a `strategy` is provided, it is used directly instead of the factory.
+
+### Initialization
+
+`registerModules` sets up clients, registers listeners and calls lifecycle hooks. If you are in preview mode, listeners are skipped.
+
+```ts packages/microservices/nest-microservice.ts
+public async registerModules(): Promise<any> {
+  await this.loadSocketModule();
+  this.socketModule &&
+    (await this.socketModule.register(
+      this.container,
+      this.applicationConfig,
+      this.graphInspector,
+      this.appOptions,
+    ));
+
+  if (!this.appOptions.preview) {
+    this.microservicesModule.setupClients(this.container);
+    this.registerListeners();
+  }
+  this.setIsInitialized(true);
+
+  if (!this.wasInitHookCalled) {
+    await this.callInitHook();
+    await this.callBootstrapHook();
+  }
+}
+```
+
+### listen and close
+
+`listen` delegates to `serverInstance.listen` and returns a promise. `close` shuts down the transport server and then runs the full application shutdown lifecycle.
+
+```ts packages/microservices/nest-microservice.ts
+public async listen(): Promise<any> {
+  this.assertNotInPreviewMode('listen');
+  !this.isInitialized && (await this.registerModules());
+
+  return new Promise<any>((resolve, reject) => {
+    this.serverInstance.listen((err, info) => {
+      if (this.microserviceConfig?.autoFlushLogs ?? true) {
+        this.flushLogs();
+      }
+      if (err) {
+        return reject(err as Error);
+      }
+      this.logger.log(MESSAGES.MICROSERVICE_READY);
+      resolve(info);
+    });
+  });
+}
+```
+
+## Server Base Class and Built-in Transports
+
+`Server` in `packages/microservices/server/server.ts` is the abstract base for all transport servers. It stores a map of normalized pattern strings to `MessageHandler` functions, provides a reactive `status` observable and defines `addHandler`, `getHandlerByPattern`, `send` and `handleEvent`.
+
+```ts packages/microservices/server/server.ts
+export abstract class Server implements ITransportServer {
+  protected readonly messageHandlers = new Map<string, MessageHandler>();
+
+  public addHandler(
+    pattern: any,
+    callback: MessageHandler,
+    isEventHandler = false,
+    extras: Record<string, any> = {},
+  ) {
+    const normalizedPattern = this.normalizePattern(pattern);
+    callback.isEventHandler = isEventHandler;
+    callback.extras = extras;
+
+    if (this.messageHandlers.has(normalizedPattern) && isEventHandler) {
+      const headRef = this.messageHandlers.get(normalizedPattern)!;
+      const getTail = (handler: MessageHandler) =>
+        handler?.next ? getTail(handler.next) : handler;
+
+      const tailRef = getTail(headRef);
+      tailRef.next = callback;
+    } else {
+      this.messageHandlers.set(normalizedPattern, callback);
+    }
+  }
+}
+```
+
+### Handler Chaining for Events
+
+When multiple `@EventPattern` decorators target the same pattern, `addHandler` chains them via a `next` property so they run sequentially. The last handler in the chain returns the cumulative result.
+
+### send and handleEvent
+
+`send` drains an observable stream into a respond callback, batching packets on `process.nextTick`. `handleEvent` looks up the handler, wraps the result in an observable if needed and calls the processing hooks.
+
+```ts packages/microservices/server/server.ts
+public async handleEvent(
+  pattern: string,
+  packet: ReadPacket,
+  context: BaseRpcContext,
+): Promise<any> {
+  const handler = this.getHandlerByPattern(pattern);
+  if (!handler) {
+    return this.logger.error(NO_EVENT_HANDLER`${pattern}`);
+  }
+  return this.onProcessingStartHook(this.transportId!, context, async () => {
+    const resultOrStream = await handler(packet.data, context);
+    if (isObservable(resultOrStream)) {
+      const connectableSource = connectable(
+        resultOrStream.pipe(
+          finalize(() =>
+            this.onProcessingEndHook?.(this.transportId!, context),
+          ),
+        ),
+        {
+          connector: () => new Subject(),
+          resetOnDisconnect: false,
+        },
+      );
+      connectableSource.connect();
+    } else {
+      this.onProcessingEndHook?.(this.transportId!, context);
+    }
+  });
+}
+```
+
+### Built-in Servers
+
+`ServerFactory.create` instantiates the correct server based on the `Transport` enum:
+
+| Transport | Server class | File |
+| --- | --- | --- |
+| `Transport.TCP` | `ServerTCP` | `server/server-tcp.ts` |
+| `Transport.REDIS` | `ServerRedis` | `server/server-redis.ts` |
+| `Transport.NATS` | `ServerNats` | `server/server-nats.ts` |
+| `Transport.MQTT` | `ServerMqtt` | `server/server-mqtt.ts` |
+| `Transport.RMQ` | `ServerRMQ` | `server/server-rmq.ts` |
+| `Transport.KAFKA` | `ServerKafka` | `server/server-kafka.ts` |
+| `Transport.GRPC` | `ServerGrpc` | `server/server-grpc.ts` |
+
+Each concrete server implements `listen`, `close`, `on` and `unwrap` and translates its broker-specific messages into the common `ReadPacket` / `WritePacket` shape.
+
+### Custom Transport Strategy
+
+You can provide an entirely custom transport by passing a `strategy` that implements `CustomTransportStrategy`:
+
+```ts
+export interface CustomTransportStrategy {
+  transportId?: TransportId;
+  listen(callback: (...optionalParams: unknown[]) => any): any;
+  close(): any;
+}
+```
+
+When `strategy` is present in the config, `createServer` skips the factory and uses your implementation directly.
+
+## MicroservicesModule and ListenersController
+
+`MicroservicesModule` is created per microservice application. It creates the `RpcContextCreator`, `ListenersController` and `ClientsContainer`.
+
+```ts packages/microservices/microservices-module.ts
+public register(
+  container: NestContainer,
+  graphInspector: GraphInspector,
+  config: ApplicationConfig,
+  options: TAppOptions,
+) {
+  this.appOptions = options;
+  const exceptionFiltersContext = new ExceptionFiltersContext(
+    container,
+    config,
+  );
+  const contextCreator = new RpcContextCreator(
+    new RpcProxy(),
+    exceptionFiltersContext,
+    new PipesContextCreator(container, config),
+    new PipesConsumer(),
+    new GuardsContextCreator(container, config),
+    new GuardsConsumer(),
+    new InterceptorsContextCreator(container, config),
+    new InterceptorsConsumer(),
+    config,
+  );
+  const injector = new Injector({
+    preview: container.contextOptions?.preview ?? false,
+    instanceDecorator: container.contextOptions?.instrument?.instanceDecorator,
+  });
+  this.listenersController = new ListenersController(
+    this.clientsContainer,
+    contextCreator,
+    container,
+    injector,
+    ClientProxyFactory,
+    exceptionFiltersContext,
+    graphInspector,
+  );
+}
+```
+
+`setupListeners` iterates every module's controllers and calls `bindListeners`, which in turn calls `registerPatternHandlers` for each controller. When `NestMicroservice.registerModules` runs, it calls `registerListeners()`, which delegates to `setupListeners` on the `MicroservicesModule`.
+
+### ListenerMetadataExplorer
+
+`ListenerMetadataExplorer` scans controller prototypes for `@MessagePattern` and `@EventPattern` methods using `MetadataScanner`. It returns an array of `EventOrMessageListenerDefinition` objects containing the pattern, method key, transport and extras.
+
+```ts packages/microservices/listener-metadata-explorer.ts
+public explore(instance: Controller): EventOrMessageListenerDefinition[] {
+  const instancePrototype = Object.getPrototypeOf(instance);
+  return this.metadataScanner
+    .getAllMethodNames(instancePrototype)
+    .map(method =>
+      this.exploreMethodMetadata(instance, instancePrototype, method)!,
+    )
+    .filter(metadata => metadata);
+}
+```
+
+### Registering Pattern Handlers
+
+`ListenersController.registerPatternHandlers` creates either a static proxy (for static dependency trees) or a request-scoped async handler. It filters patterns by transport ID when multiple transports share the same module.
+
+```ts packages/microservices/listeners-controller.ts
+public registerPatternHandlers(
+  instanceWrapper: InstanceWrapper<Controller>,
+  serverInstance: Server,
+  moduleKey: string,
+) {
+  const { instance } = instanceWrapper;
+
+  const isStatic = instanceWrapper.isDependencyTreeStatic();
+  const patternHandlers = this.metadataExplorer.explore(instance);
+  const moduleRef = this.container.getModuleByKey(moduleKey);
+  const defaultCallMetadata =
+    serverInstance instanceof ServerGrpc
+      ? DEFAULT_GRPC_CALLBACK_METADATA
+      : DEFAULT_CALLBACK_METADATA;
+
+  patternHandlers
+    .filter(
+      ({ transport }) =>
+        isUndefined(transport) ||
+        isUndefined(serverInstance.transportId) ||
+        transport === serverInstance.transportId,
+    )
+    .flatMap(handler =>
+      handler.patterns.map(pattern => ({
+        ...handler,
+        patterns: [pattern],
+      })),
+    )
+    .forEach((definition: EventOrMessageListenerDefinition) => {
+      const {
+        patterns: [pattern],
+        targetCallback,
+        methodKey,
+        extras,
+        isEventHandler,
+      } = definition;
+
+      this.insertEntrypointDefinition(
+        instanceWrapper, definition, serverInstance.transportId!,
+      );
+
+      if (isStatic) {
+        const proxy = this.contextCreator.create(
+          instance, targetCallback, moduleKey, methodKey,
+          STATIC_CONTEXT, undefined, defaultCallMetadata,
+        );
+        if (isEventHandler) {
+          const eventHandler: MessageHandler = async (...args: unknown[]) => {
+            const originalArgs = args;
+            const [dataOrContextHost] = originalArgs;
+            if (dataOrContextHost instanceof RequestContextHost) {
+              args = args.slice(1, args.length);
+            }
+            const returnValue = proxy(...args);
+            return this.forkJoinHandlersIfAttached(
+              returnValue, originalArgs, eventHandler,
+            );
+          };
+          return serverInstance.addHandler(
+            pattern, eventHandler, isEventHandler, extras,
+          );
+        } else {
+          return serverInstance.addHandler(
+            pattern, proxy, isEventHandler, extras,
+          );
+        }
+      }
+      const asyncHandler = this.createRequestScopedHandler(
+        instanceWrapper, pattern, moduleRef!, moduleKey, methodKey,
+        defaultCallMetadata, isEventHandler,
+      );
+      serverInstance.addHandler(
+        pattern, asyncHandler, isEventHandler, extras,
+      );
+    });
+}
+```
+
+For event handlers, the controller wraps the proxy in an async function that also calls `forkJoinHandlersIfAttached` to run any chained `.next` handlers.
+
+### Request-Scoped Handler Creation
+
+For request-scoped controllers, `createRequestScopedHandler` derives a `ContextId` from the incoming `RequestContextHost` or creates one from the raw data. It then calls `Injector.loadPerContext` to resolve a fresh controller instance and builds a new `RpcContextCreator` proxy for that context.
+
+```ts packages/microservices/listeners-controller.ts
+public createRequestScopedHandler(...) {
+  const isTreeDurable = wrapper.isDependencyTreeDurable();
+
+  const requestScopedHandler: MessageHandler = async (...args: unknown[]) => {
+    try {
+      let contextId: ContextId;
+
+      let [dataOrContextHost] = args;
+      if (dataOrContextHost instanceof RequestContextHost) {
+        contextId = this.getContextId(dataOrContextHost, isTreeDurable);
+        args.shift();
+      } else {
+        const [data, reqCtx] = args;
+        const request = RequestContextHost.create(
+          pattern,
+          data,
+          reqCtx as BaseRpcContext,
+        );
+        contextId = this.getContextId(request, isTreeDurable);
+        dataOrContextHost = request;
+      }
+      const contextInstance = await this.injector.loadPerContext(
+        instance, moduleRef, collection, contextId,
+      );
+      const proxy = this.contextCreator.create(
+        contextInstance,
+        contextInstance[methodKey],
+        moduleKey,
+        methodKey,
+        contextId,
+        wrapper.id,
+        defaultCallMetadata,
+      );
+
+      const returnValue = proxy(...args);
+      if (isEventHandler) {
+        return this.forkJoinHandlersIfAttached(
+          returnValue,
+          [dataOrContextHost, ...args],
+          requestScopedHandler,
+        );
+      }
+      return returnValue;
+    } catch (err) {
+      let exceptionFilter = this.exceptionFiltersCache.get(
+        instance[methodKey],
+      );
+      // ...
+    }
+  };
+}
+```
+
+## RpcContextCreator
+
+`RpcContextCreator` builds the execution pipeline for each RPC handler. It mirrors the HTTP pipeline but uses `RpcProxy` and `RpcParamsFactory`.
+
+```ts packages/microservices/context/rpc-context-creator.ts
+public create(
+  instance: Controller,
+  callback: (...args: unknown[]) => Observable<any>,
+  moduleKey: string,
+  methodName: string,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+  defaultCallMetadata = DEFAULT_CALLBACK_METADATA,
+): (...args: any[]) => Promise<Observable<any>> {
+  const contextType: ContextType = 'rpc';
+  const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata(
+    instance, methodName, defaultCallMetadata, contextType,
+  );
+
+  const exceptionHandler = this.exceptionFiltersContext.create(...);
+  const pipes = this.pipesContextCreator.create(...);
+  const guards = this.guardsContextCreator.create(...);
+  const interceptors = this.interceptorsContextCreator.create(...);
+
+  const paramsMetadata = getParamsMetadata(moduleKey);
+  const paramsOptions = paramsMetadata
+    ? this.contextUtils.mergeParamsMetatypes(paramsMetadata, paramtypes)
+    : [];
+  const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+
+  const fnCanActivate = this.createGuardsFn(
+    guards, instance, callback, contextType,
+  );
+
+  const handler = (initialArgs: unknown[], args: unknown[]) => async () => {
+    if (fnApplyPipes) {
+      await fnApplyPipes(initialArgs, ...args);
+      return callback.apply(instance, initialArgs);
+    }
+    return callback.apply(instance, args);
+  };
+
+  const preRequestHooks =
+    this.applicationConfig?.getGlobalPreRequestHooks() ?? [];
+
+  return this.rpcProxy.create(async (...args: unknown[]) => {
+    const initialArgs = this.contextUtils.createNullArray(argsLength);
+
+    const executePipeline = async () => {
+      fnCanActivate && (await fnCanActivate(args));
+      return this.interceptorsConsumer.intercept(
+        interceptors, args, instance, callback,
+        handler(initialArgs, args), contextType,
+      ) as Promise<Observable<unknown>>;
+    };
+
+    if (preRequestHooks.length === 0) {
+      return executePipeline();
+    }
+
+    const executionContext = new ExecutionContextHost(
+      args, instance.constructor as any, callback,
+    );
+    executionContext.setType(contextType);
+
+    const pipelineObs: Observable<unknown> = defer(() =>
+      from(executePipeline()).pipe(mergeMap(obs => obs)),
+    );
+
+    let index = 0;
+    const next = (): Observable<unknown> => {
+      if (index >= preRequestHooks.length) return pipelineObs;
+      return preRequestHooks[index++](executionContext, next);
+    };
+
+    return next();
+  }, exceptionHandler);
+}
+```
+
+If `preRequestHooks` are registered on the `ApplicationConfig`, they are executed before the pipeline via a recursive `next` function that returns an observable.
+
+## ClientProxy and ClientProxyFactory
+
+The client side of microservices is managed through `ClientProxy`, an abstract class that exposes `send` (request-response) and `emit` (fire-and-forget).
+
+```ts packages/microservices/client/client-proxy.ts
+export abstract class ClientProxy {
+  public send<TResult = any, TInput = any>(
+    pattern: any,
+    data: TInput,
+  ): Observable<TResult> {
+    if (isNil(pattern) || isNil(data)) {
+      return _throw(() => new InvalidMessageException());
+    }
+    return defer(async () => this.connect()).pipe(
+      mergeMap(
+        () =>
+          new Observable((observer: Observer<TResult>) => {
+            const callback = this.createObserver(observer);
+            return this.publish({ pattern, data }, callback);
+          }),
+      ),
+    );
+  }
+
+  public emit<TResult = any, TInput = any>(
+    pattern: any,
+    data: TInput,
+  ): Observable<TResult> {
+    if (isNil(pattern) || isNil(data)) {
+      return _throw(() => new InvalidMessageException());
+    }
+    const source = defer(async () => this.connect()).pipe(
+      mergeMap(() => this.dispatchEvent({ pattern, data })),
+    );
+    const connectableSource = connectable(source, {
+      connector: () => new Subject(),
+      resetOnDisconnect: false,
+    });
+    connectableSource.connect();
+    return connectableSource;
+  }
+}
+```
+
+`ClientProxyFactory.create` returns a concrete client for the selected transport, matching the same `Transport` enum used on the server side. `ClientsModule.register` and `registerAsync` provide a declarative way to inject clients as providers.
+
+## Decorators
+
+Microservices use a dedicated set of decorators that store metadata on the handler functions:
+
+| Decorator | Metadata Keys | Purpose |
+| --- | --- | --- |
+| `@MessagePattern` | `PATTERN_METADATA`, `PATTERN_HANDLER_METADATA`, `TRANSPORT_METADATA`, `PATTERN_EXTRAS_METADATA` | Request-response handler |
+| `@EventPattern` | Same as above, but `PatternHandler.EVENT` | Event handler (no reply expected) |
+| `@Payload` | `PARAM_ARGS_METADATA` with `RpcParamtype.PAYLOAD` | Extracts incoming data |
+| `@Ctx` | `PARAM_ARGS_METADATA` with `RpcParamtype.CONTEXT` | Extracts transport context |
+| `@Client` | `CLIENT_METADATA`, `CLIENT_CONFIGURATION_METADATA` | Injects a `ClientProxy` property |
+
+```ts packages/microservices/decorators/message-pattern.decorator.ts
+export const MessagePattern = <T = PatternMetadata | string>(
+  metadata?: T,
+  transportOrExtras?: Transport | symbol | Record<string, any>,
+  maybeExtras?: Record<string, any>,
+): MethodDecorator => {
+  return (target, key, descriptor) => {
+    Reflect.defineMetadata(
+      PATTERN_METADATA, ([] as any[]).concat(metadata), descriptor.value,
+    );
+    Reflect.defineMetadata(
+      PATTERN_HANDLER_METADATA, PatternHandler.MESSAGE, descriptor.value,
+    );
+    Reflect.defineMetadata(TRANSPORT_METADATA, transport, descriptor.value);
+    Reflect.defineMetadata(
+      PATTERN_EXTRAS_METADATA, extras, descriptor.value,
+    );
+    return descriptor;
+  };
+};
+```
+
+## Exception Handling
+
+The RPC exception pipeline uses `RpcException`, `BaseRpcExceptionFilter` and `RpcExceptionsHandler`.
+
+```ts packages/microservices/exceptions/base-rpc-exception-filter.ts
+export class BaseRpcExceptionFilter implements RpcExceptionFilter {
+  public catch(exception, host: ArgumentsHost): Observable {
+    const status = 'error';
+    if (!(exception instanceof RpcException)) {
+      return this.handleUnknownError(exception, status);
+    }
+    const res = exception.getError();
+    const message = isObject(res) ? res : { status, message: res };
+    return _throw(() => message);
+  }
+}
+```
+
+`RpcExceptionsHandler` extends the base filter and adds custom filter resolution. The handler returns an observable so RPC servers can stream the error back to the caller.
+
+## Serializers and Deserializers
+
+Both servers and clients support custom serialization. The defaults are `IdentitySerializer` for the server serializer and `IncomingRequestDeserializer` for the server deserializer. Transports such as Kafka and NATS provide their own record serializers and JSON deserializers to support broker-specific envelope formats.
+
+## Hybrid Applications
+
+A hybrid application lets an HTTP server and one or more microservices share the same `NestContainer` and singleton providers. You connect a microservice with `NestApplication.connectMicroservice` and start all attached microservices with `startAllMicroservices`.
+
+```ts packages/core/nest-application.ts
+public connectMicroservice<T extends object>(
+  microserviceOptions: T,
+  hybridAppOptions: NestHybridApplicationOptions = {},
+): INestMicroservice {
+  const { NestMicroservice } = loadPackageCached(
+    '@nestjs/microservices', 'NestFactory',
+  );
+  const { inheritAppConfig } = hybridAppOptions;
+  const applicationConfig = inheritAppConfig
+    ? this.config
+    : new ApplicationConfig();
+
+  const instance = new NestMicroservice(
+    this.container, microserviceOptions,
+    this.graphInspector, applicationConfig,
+  );
+
+  if (!hybridAppOptions.deferInitialization) {
+    instance.registerListeners();
+    instance.setIsInitialized(true);
+    instance.setIsInitHookCalled(true);
+  }
+  this.microservices.push(instance);
+  return instance;
+}
+```
+
+```ts packages/core/nest-application.ts
+public async startAllMicroservices(): Promise<this> {
+  this.assertNotInPreviewMode('startAllMicroservices');
+  await Promise.all(this.microservices.map(msvc => msvc.listen()));
+  return this;
+}
+```
+
+The `inheritAppConfig` option in `NestHybridApplicationOptions` lets the microservice reuse global enhancers configured on the HTTP application.
+
+## Example Controller
+
+The following example is modeled on `integration/microservices/src/app.controller.ts`:
+
+```ts
+import { Controller } from '@nestjs/common';
+import { MessagePattern, EventPattern } from '@nestjs/microservices';
+
+@Controller()
+export class MathController {
+  @MessagePattern({ cmd: 'sum' })
+  sum(data: number[]): number {
+    return data.reduce((a, b) => a + b);
+  }
+
+  @EventPattern('notification')
+  handleNotification(data: boolean) {
+    console.log('Notification received:', data);
+  }
+}
+```
+
+When `NestMicroservice` initializes, `MicroservicesModule.setupListeners` walks all controllers, `ListenerMetadataExplorer` discovers the `sum` and `handleNotification` methods and `ListenersController` registers them on the `ServerTCP` instance. A client calling `client.send({ cmd: 'sum' }, [1, 2, 3])` receives `6` as a response, while `client.emit('notification', true)` triggers the event handler without awaiting a reply.
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/microservices/nest-microservice.ts` | Microservice application lifecycle, server creation, global enhancers |
+| `packages/microservices/microservices-module.ts` | Registration of `RpcContextCreator`, `ListenersController`, `ClientsContainer` |
+| `packages/microservices/listeners-controller.ts` | Registers pattern handlers on the server, request-scoped handler creation |
+| `packages/microservices/listener-metadata-explorer.ts` | Discovers `@MessagePattern` and `@EventPattern` methods |
+| `packages/microservices/server/server.ts` | Abstract server base, handler map, `send`, `handleEvent` |
+| `packages/microservices/server/server-factory.ts` | Maps `Transport` enum to concrete server classes |
+| `packages/microservices/context/rpc-context-creator.ts` | Builds RPC execution pipeline (guards, pipes, interceptors) |
+| `packages/microservices/context/rpc-proxy.ts` | Wraps handler with exception handling |
+| `packages/microservices/client/client-proxy.ts` | Abstract client with `send` and `emit` |
+| `packages/microservices/client/client-proxy-factory.ts` | Creates concrete `ClientProxy` instances by transport |
+| `packages/microservices/module/clients.module.ts` | Declarative client registration module |
+| `packages/microservices/exceptions/base-rpc-exception-filter.ts` | Default RPC exception filter |
+| `packages/microservices/exceptions/rpc-exceptions-handler.ts` | Custom filter resolution for RPC |
+| `packages/microservices/decorators/message-pattern.decorator.ts` | `@MessagePattern` and gRPC decorators |
+| `packages/microservices/decorators/event-pattern.decorator.ts` | `@EventPattern` decorator |
+| `packages/microservices/decorators/payload.decorator.ts` | `@Payload` parameter decorator |
+| `packages/microservices/decorators/ctx.decorator.ts` | `@Ctx` parameter decorator |
+| `packages/core/nest-application.ts` | Hybrid application support (`connectMicroservice`, `startAllMicroservices`) |

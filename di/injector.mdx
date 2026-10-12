@@ -1,0 +1,435 @@
+---
+title: "Nest Injector: Constructor and Property Dependency Resolution"
+description: "How the Injector class resolves constructor parameters, property injections, factory providers, forwardRef, circular dependencies, and optional dependencies in Nest."
+sidebarTitle: "Injector"
+---
+
+After the `DependenciesScanner` has built the module graph, every provider and controller is still an unresolved `InstanceWrapper`. The `Injector` class in `packages/core/injector/injector.ts` turns those wrappers into live instances by recursively resolving dependencies. It handles constructor injection, property injection, custom providers (factories and values), `forwardRef`, optional dependencies, circular dependency detection, and the coordination needed for request-scoped and transient providers.
+
+This page walks through the main resolution pipeline, the internal helpers that manage concurrent requests for the same instance, and the error classes that surface when resolution fails.
+
+## InstanceLoader: the two-phase bootstrap
+
+`InstanceLoader` lives in `packages/core/injector/instance-loader.ts`. It orchestrates instantiation at the module level, but it delegates the actual work to `Injector`. The loader runs in two distinct phases for every module:
+
+1. **Prototype phase** (`createPrototypes`): every provider, injectable, and controller gets a prototype object created via `Object.create(metatype.prototype)`. This allows `forwardRef` circular dependencies to receive a partially constructed instance.
+2. **Instance phase** (`createInstances`): every wrapper is passed to `Injector.loadProvider`, `Injector.loadController`, or `Injector.loadInjectable` to resolve dependencies and call the constructor.
+
+```ts packages/core/injector/instance-loader.ts
+public async createInstancesOfDependencies(modules: Map<string, Module> = this.container.getModules()) {
+  this.createPrototypes(modules);
+  try {
+    await this.createInstances(modules);
+  } catch (err) {
+    this.graphInspector.inspectModules(modules);
+    this.graphInspector.registerPartial(err);
+    throw err;
+  }
+  this.graphInspector.inspectModules(modules);
+}
+```
+
+Prototype creation is synchronous and light. Instance creation is async because factory providers and property injection may involve promises.
+
+## `loadInstance`: the central resolution method
+
+`Injector.loadInstance` is called for every wrapper that needs to become a real object. It manages three critical pieces of state: `isPending`, `donePromise`, and `settlementSignal`.
+
+```ts packages/core/injector/injector.ts
+public async loadInstance<T>(
+  wrapper: InstanceWrapper<T>,
+  collection: Map<InjectionToken, InstanceWrapper>,
+  moduleRef: Module,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+) {
+  const inquirerId = this.getContextInquirerId(resolutionContext);
+  const instanceHost = wrapper.getInstanceByContextId(
+    this.getContextId(resolutionContext.contextId, wrapper),
+    inquirerId,
+  );
+
+  if (instanceHost.isPending) {
+    const settlementSignal = wrapper.settlementSignal;
+    if (resolutionContext.inquirer && settlementSignal?.isCycle(resolutionContext.inquirer.id)) {
+      throw new CircularDependencyException(`"${wrapper.name}"`);
+    }
+    return instanceHost.donePromise!.then((err?: unknown) => {
+      if (err) throw err;
+    });
+  }
+
+  const settlementSignal = this.applySettlementSignal(instanceHost, wrapper);
+  // ...
+}
+```
+
+If another resolution is already in progress (`isPending`), `loadInstance` waits on `donePromise`. This is the mechanism that allows parallel branches of the dependency graph to share a single instance without double-instantiation. The `SettlementSignal` (described below) also detects cycles: if the inquirer that is requesting this wrapper is already tracked as a dependency of the wrapper, a `CircularDependencyException` is thrown immediately.
+
+Once the host is marked pending, the method proceeds:
+
+1. Calls `resolveConstructorParams` to obtain all constructor arguments.
+2. Within the constructor callback, calls `resolveProperties` to obtain all property-injected values.
+3. Calls `instantiateClass` with the constructor arguments.
+4. Applies resolved properties via `applyProperties`.
+5. Calls `settlementSignal.complete()` so that any waiting callers can proceed.
+
+If any step throws, the instance host is removed and `settlementSignal.error(err)` is called so that waiting callers receive the same error.
+
+## `resolveConstructorParams`: parallel parameter resolution
+
+`resolveConstructorParams` determines which dependencies a class needs and resolves them in parallel.
+
+For ordinary class providers, it reads `PARAMTYPES_METADATA` (the TypeScript `design:paramtypes` emitted by `reflect-metadata`) and merges it with `SELF_DECLARED_DEPS_METADATA` (dependencies declared with `@Inject()`). For factory providers, it reads the `inject` array and unwraps any `OptionalFactoryDependency` objects.
+
+```ts packages/core/injector/injector.ts
+public getClassDependencies<T>(wrapper: InstanceWrapper<T>): [InjectorDependency[], number[]] {
+  const ctorRef = wrapper.metatype as Type<any>;
+  return [
+    this.reflectConstructorParams(ctorRef),
+    this.reflectOptionalParams(ctorRef),
+  ];
+}
+
+public reflectConstructorParams(type: Type<unknown> | Function): any[] {
+  const paramtypes = [...(Reflect.getMetadata(PARAMTYPES_METADATA, type) || [])];
+  const selfParams = this.reflectSelfParams(type);
+  selfParams.forEach(({ index, param }) => (paramtypes[index] = param));
+  return Array.from(paramtypes);
+}
+```
+
+Each parameter is resolved via `resolveSingleParam`. The method uses a `Barrier` to coordinate parallel resolution: every parameter worker calls `paramBarrier.signalAndWait()`, which ensures that all workers have reached the barrier before any worker proceeds to evaluate whether the dependency tree is fully resolved.
+
+### `resolveSingleParam` and token resolution
+
+`resolveSingleParam` validates that the parameter is not `undefined` (which would indicate a circular import or missing decorator), resolves `forwardRef` objects, and delegates to `resolveComponentWrapper`.
+
+```ts packages/core/injector/injector.ts
+public async resolveSingleParam<T>(
+  wrapper: InstanceWrapper<T>,
+  param: Type<any> | string | symbol,
+  dependencyContext: InjectorDependencyContext,
+  moduleRef: Module,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+  keyOrIndex?: symbol | string | number,
+) {
+  if (isUndefined(param)) {
+    throw new UndefinedDependencyException(wrapper.name, dependencyContext, moduleRef);
+  }
+  const token = this.resolveParamToken(wrapper, param);
+  return this.resolveComponentWrapper(moduleRef, token, dependencyContext, wrapper, resolutionContext, keyOrIndex);
+}
+```
+
+`resolveParamToken` checks for `forwardRef` objects and sets `wrapper.forwardRef = true` when one is encountered. This flag is critical later: if a dependency is being resolved while its own constructor is still pending, the framework can merge the freshly constructed instance into the pre-created prototype.
+
+## Looking up dependencies: module-local then imports
+
+`resolveComponentWrapper` first checks the current module's `providers` map. If the token is found there, the wrapper is returned immediately. Otherwise it delegates to `lookupComponentInParentModules`.
+
+```ts packages/core/injector/injector.ts
+public async lookupComponent<T = any>(
+  providers: Map<Function | string | symbol, InstanceWrapper>,
+  moduleRef: Module,
+  dependencyContext: InjectorDependencyContext,
+  wrapper: InstanceWrapper<T>,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+  keyOrIndex?: symbol | string | number,
+): Promise<InstanceWrapper<T>> {
+  const token = wrapper.token || wrapper.name;
+  const { name } = dependencyContext;
+  if (wrapper && token === name) {
+    throw new UnknownDependenciesException(wrapper.name, dependencyContext, moduleRef, { id: wrapper.id });
+  }
+  if (name && providers.has(name)) {
+    const instanceWrapper = providers.get(name)!;
+    this.addDependencyMetadata(keyOrIndex!, wrapper, instanceWrapper);
+    return instanceWrapper;
+  }
+  return this.lookupComponentInParentModules(
+    dependencyContext, moduleRef, wrapper, resolutionContext, keyOrIndex,
+  );
+}
+```
+
+The self-reference check (`token === name`) prevents a provider from injecting itself directly. If it passes, the method looks in the local provider map. Only if the token is not found locally does the search continue into imported modules.
+
+`lookupComponentInParentModules` in turn delegates to `lookupComponentInImports`. This method walks the `_imports` set recursively. When traversing beyond the first level, it filters children to only those whose module token is present in the current module's `_exports`. This is important because re-exported modules can only re-export what they explicitly export.
+
+```ts packages/core/injector/injector.ts
+public async lookupComponentInImports(
+  moduleRef: Module,
+  name: InjectionToken,
+  wrapper: InstanceWrapper,
+  moduleRegistry: Set<string> = new Set<string>(),
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+  keyOrIndex?: symbol | string | number,
+  isTraversing?: boolean,
+): Promise<any> {
+  let instanceWrapperRef: InstanceWrapper | null = null;
+  const imports = moduleRef.imports || new Set<Module>();
+  let children = [...imports.values()];
+  if (isTraversing) {
+    const contextModuleExports = moduleRef.exports;
+    children = children.filter(child => contextModuleExports.has(child.metatype));
+  }
+  for (const relatedModule of children) {
+    if (moduleRegistry.has(relatedModule.id)) {
+      continue;
+    }
+    moduleRegistry.add(relatedModule.id);
+    const { providers, exports } = relatedModule;
+    if (!exports.has(name) || !providers.has(name)) {
+      const instanceRef = await this.lookupComponentInImports(
+        relatedModule, name, wrapper, moduleRegistry, resolutionContext, keyOrIndex, true,
+      );
+      if (instanceRef) {
+        this.addDependencyMetadata(keyOrIndex!, wrapper, instanceRef);
+        return instanceRef;
+      }
+      continue;
+    }
+    instanceWrapperRef = providers.get(name)!;
+    this.addDependencyMetadata(keyOrIndex!, wrapper, instanceWrapperRef);
+    break;
+  }
+  return instanceWrapperRef;
+}
+```
+
+The search stops at the first direct export match. This preserves explicit imports over global modules: if a module directly imports `CatsService`, that import wins even if a global module also provides `CatsService`.
+
+## `resolveComponentHost`: triggering instantiation
+
+After a wrapper is found, `resolveComponentHost` ensures that the wrapper's instance host is resolved. If the host is not yet resolved and the wrapper is not a `forwardRef`, it calls `loadProvider` on the wrapper's host module. This is the recursive step that eventually walks the entire dependency tree.
+
+```ts packages/core/injector/injector.ts
+public async resolveComponentHost<T>(
+  moduleRef: Module,
+  instanceWrapper: InstanceWrapper<T | Promise<T>>,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+): Promise<InstanceWrapper> {
+  const inquirerId = this.getContextInquirerId(resolutionContext);
+  const instanceHost = instanceWrapper.getInstanceByContextId(
+    this.getContextId(resolutionContext.contextId, instanceWrapper),
+    inquirerId,
+  );
+  if (!instanceHost.isResolved && !instanceWrapper.forwardRef) {
+    resolutionContext.inquirer?.settlementSignal?.insertRef(instanceWrapper.id);
+    await this.loadProvider(instanceWrapper, instanceWrapper.host ?? moduleRef, resolutionContext);
+  } else if (
+    !instanceHost.isResolved &&
+    instanceWrapper.forwardRef &&
+    (resolutionContext.contextId !== STATIC_CONTEXT || !!inquirerId)
+  ) {
+    if (instanceHost.donePromise) {
+      void instanceHost.donePromise
+        .then(() => this.loadProvider(instanceWrapper, instanceWrapper.host ?? moduleRef, resolutionContext))
+        .catch(err => { instanceWrapper.settlementSignal?.error(err); });
+    } else {
+      await this.loadProvider(instanceWrapper, instanceWrapper.host ?? moduleRef, resolutionContext);
+    }
+  }
+  if (instanceWrapper.async) {
+    const host = instanceWrapper.getInstanceByContextId(
+      this.getContextId(resolutionContext.contextId, instanceWrapper), inquirerId,
+    );
+    host.instance = await host.instance;
+    instanceWrapper.setInstanceByContextId(resolutionContext.contextId, host, inquirerId);
+  }
+  return instanceWrapper;
+}
+```
+
+Notice the `insertRef` call on `settlementSignal`. This records that the inquirer depends on `instanceWrapper.id`, which enables cycle detection when a later lookup encounters the same pending wrapper.
+
+The `forwardRef` branch handles request-scoped and transient circular dependencies specially. If `donePromise` exists, it chains the provider load to the promise so that the prototype created earlier is merged correctly.
+
+## `instantiateClass`: construction and factory providers
+
+`instantiateClass` is the final step of the constructor callback in `loadInstance`. It uses `new metatype(...instances)` for class providers, or calls the factory function directly for factory providers.
+
+```ts packages/core/injector/injector.ts
+public async instantiateClass<T = any>(
+  instances: any[],
+  wrapper: InstanceWrapper,
+  targetMetatype: InstanceWrapper,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+): Promise<T> {
+  const { metatype, inject } = wrapper;
+  const instanceHost = targetMetatype.getInstanceByContextId(
+    this.getContextId(resolutionContext.contextId, targetMetatype),
+    this.getContextInquirerId(resolutionContext),
+  );
+  const isInContext = this.isInContext(wrapper, resolutionContext);
+
+  if (this.options?.preview && !wrapper.host?.initOnPreview) {
+    instanceHost.isResolved = true;
+    return instanceHost.instance;
+  }
+
+  if (isNil(inject) && isInContext) {
+    instanceHost.instance = wrapper.forwardRef
+      ? Object.assign(instanceHost.instance, new (metatype as Type<any>)(...instances))
+      : new (metatype as Type<any>)(...instances);
+    instanceHost.instance = this.instanceDecorator(instanceHost.instance);
+    instanceHost.isConstructorCalled = true;
+  } else if (isInContext) {
+    const factoryReturnValue = (targetMetatype.metatype as any as Function)(...instances);
+    instanceHost.instance = await factoryReturnValue;
+    instanceHost.instance = this.instanceDecorator(instanceHost.instance);
+    instanceHost.isConstructorCalled = true;
+  }
+  instanceHost.isResolved = true;
+  return instanceHost.instance;
+}
+```
+
+When `forwardRef` is true, the pre-created prototype from the prototype phase is merged with the newly constructed instance via `Object.assign`. This is how circular dependencies between classes are resolved: both classes get a prototype early, and the real instances are later merged back into those prototypes.
+
+In preview mode, instantiation is skipped unless the wrapper's host module has `initOnPreview` enabled.
+
+## Property injection
+
+Property injection is resolved by `resolveProperties`, which reads `PROPERTY_DEPS_METADATA` and `OPTIONAL_PROPERTY_DEPS_METADATA` from `reflect-metadata`. For each property, it calls `resolveSingleParam` with the property key as the `keyOrIndex`, then assigns the result to the instance after construction.
+
+```ts packages/core/injector/injector.ts
+public reflectProperties<T>(type: Type<T>): PropertyDependency[] {
+  const properties = Reflect.getMetadata(PROPERTY_DEPS_METADATA, type) || [];
+  const optionalKeys: string[] = Reflect.getMetadata(OPTIONAL_PROPERTY_DEPS_METADATA, type) || [];
+  return properties.map((item: any) => ({
+    ...item,
+    name: item.type,
+    isOptional: optionalKeys.includes(item.key),
+  }));
+}
+```
+
+If `inject` is defined on the wrapper (factory provider), property injection is skipped because factory providers return the instance directly.
+
+## Circular dependency detection and `SettlementSignal`
+
+`SettlementSignal` in `packages/core/injector/settlement-signal.ts` is a lightweight coordination primitive. It wraps a promise that resolves when `complete()` or `error()` is called. It also maintains a set of `refs`: wrapper IDs that the current resolution depends on.
+
+```ts packages/core/injector/settlement-signal.ts
+export class SettlementSignal {
+  private readonly _refs = new Set();
+  private readonly settledPromise: Promise<unknown>;
+  private settleFn!: (err?: unknown) => void;
+  private completed = false;
+
+  constructor() {
+    this.settledPromise = new Promise<unknown>(resolve => {
+      this.settleFn = resolve;
+    });
+  }
+
+  public complete() {
+    this.completed = true;
+    this.settleFn();
+  }
+
+  public error(err: unknown) {
+    this.completed = true;
+    this.settleFn(err);
+  }
+
+  public insertRef(wrapperId: string) {
+    this._refs.add(wrapperId);
+  }
+
+  public isCycle(wrapperId: string) {
+    return !this.completed && this._refs.has(wrapperId);
+  }
+}
+```
+
+When `loadInstance` sees a pending host, it checks `settlementSignal.isCycle(inquirer.id)`. If true, the dependency graph contains a circular reference that `forwardRef` did not break, and `CircularDependencyException` is thrown.
+
+## Error classes
+
+When resolution fails, three primary error classes are raised:
+
+| Error class | Trigger | File |
+| --- | --- | --- |
+| `UnknownDependenciesException` | A token is not found in the module or any imported module. | `packages/core/errors/exceptions/unknown-dependencies.exception.ts` |
+| `UndefinedDependencyException` | A constructor parameter is `undefined` (missing `@Inject()` or circular import). | `packages/core/errors/exceptions/undefined-dependency.exception.ts` |
+| `CircularDependencyException` | A true cycle is detected at runtime via `SettlementSignal`. | `packages/core/errors/exceptions/circular-dependency.exception.ts` |
+
+`UnknownDependenciesException` receives the dependency context (index, dependency array, property key) and the module reference, so the error message can pinpoint exactly which constructor argument or property could not be resolved.
+
+## The `Barrier` helper
+
+`Barrier` in `packages/core/helpers/barrier.ts` is a simple countdown latch used during parallel parameter and property resolution.
+
+```ts packages/core/helpers/barrier.ts
+export class Barrier {
+  private currentCount: number;
+  private targetCount: number;
+  private promise: Promise<void>;
+  private resolve: () => void;
+
+  constructor(targetCount: number) {
+    this.currentCount = 0;
+    this.targetCount = targetCount;
+    this.promise = new Promise<void>(resolve => {
+      this.resolve = resolve;
+    });
+    if (targetCount === 0) {
+      this.resolve();
+    }
+  }
+
+  public signal(): void {
+    this.currentCount += 1;
+    if (this.currentCount >= this.targetCount) {
+      this.resolve();
+    }
+  }
+
+  public async signalAndWait(): Promise<void> {
+    this.signal();
+    return this.wait();
+  }
+}
+```
+
+Each parameter worker signals the barrier when it resolves its dependency. All workers wait at the barrier before evaluating whether every dependency is fully resolved. This prevents partial state from leaking into constructors when dependencies are still pending.
+
+## Enhancer loading
+
+After a provider or controller is instantiated, `loadProvider` and `loadController` call `loadEnhancersPerContext`. This method resolves any guards, interceptors, pipes, or exception filters attached to the wrapper when the context is request-scoped or transient:
+
+```ts packages/core/injector/injector.ts
+public async loadEnhancersPerContext(
+  wrapper: InstanceWrapper,
+  ctx: ContextId,
+  inquirer?: InstanceWrapper,
+) {
+  if (ctx === STATIC_CONTEXT) {
+    return;
+  }
+  const enhancers = wrapper.getEnhancersMetadata() || [];
+  const loadEnhancer = (item: InstanceWrapper) => {
+    const hostModule = item.host!;
+    return this.loadInstance(item, hostModule.injectables, hostModule, this.createResolutionContext(ctx, inquirer));
+  };
+  await Promise.all(enhancers.map(loadEnhancer));
+}
+```
+
+Enhancers are stored in the wrapper's metadata during scanning and are only instantiated for non-static contexts.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/injector/injector.ts` | `Injector`: constructor/property resolution, lookup, instantiation. |
+| `packages/core/injector/instance-loader.ts` | `InstanceLoader`: two-phase prototype and instance creation. |
+| `packages/core/injector/settlement-signal.ts` | `SettlementSignal`: async coordination and cycle detection. |
+| `packages/core/helpers/barrier.ts` | `Barrier`: countdown latch for parallel dependency resolution. |
+| `packages/core/errors/exceptions/circular-dependency.exception.ts` | Thrown when a runtime cycle is detected. |
+| `packages/core/errors/exceptions/unknown-dependencies.exception.ts` | Thrown when a token cannot be found. |
+| `packages/core/errors/exceptions/undefined-dependency.exception.ts` | Thrown when a parameter is undefined. |
+
+For how providers are organized into modules, see [Modules and Container](/di/modules-and-container). For the scanner that builds the dependency graph, see [Dependency Scanner](/di/dependency-scanner). For how lifetimes and instance storage work, see [Scopes and InstanceWrapper](/di/scopes-and-instance-wrapper).

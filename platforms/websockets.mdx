@@ -1,0 +1,375 @@
+---
+title: "WebSocket Gateways, Adapters and the Message Pipeline"
+sidebarTitle: "WebSockets"
+description: "Deep dive into Nest's WebSocket layer: SocketModule, WebSocketsController, gateway metadata, IoAdapter, WsAdapter, context creation and exception filtering."
+---
+
+Nest's WebSocket layer bridges application gateways to real-time transports such as Socket.IO and native WebSocket. The system lives in `packages/websockets` with platform-specific adapters in `packages/platform-socket.io` and `packages/platform-ws`. This page explains the internal flow from module registration through gateway connection, message subscription and exception handling.
+
+## Module Bootstrap and SocketModule
+
+`SocketModule` is the top-level orchestrator. It is instantiated by the core framework when a module containing `@WebSocketGateway` providers is detected. Its `register` method wires everything together:
+
+<Steps>
+  <Step title="Register dependencies">
+    `SocketModule.register` receives the `NestContainer`, `ApplicationConfig`, `GraphInspector`, application options and an optional HTTP server. It creates a `SocketsContainer`, `SocketServerProvider` and a `WebSocketsController`.
+  </Step>
+  <Step title="Create the context creator">
+    A `WsContextCreator` is assembled using `WsProxy`, the exception filters context, pipes context creator and consumer, guards context creator and consumer, and interceptors context creator and consumer. This is the same enhancer pipeline used for HTTP but specialized for WebSocket messages.
+  </Step>
+  <Step title="Connect all gateways">
+    `connectAllGateways` iterates every provider in every module and calls `connectGatewayToServer` for any class carrying `GATEWAY_METADATA`.
+  </Step>
+</Steps>
+
+```ts packages/websockets/socket-module.ts
+export class SocketModule {
+  public register(
+    container: NestContainer,
+    applicationConfig: ApplicationConfig,
+    graphInspector: GraphInspector,
+    appOptions: TAppOptions,
+    httpServer?: THttpServer,
+  ) {
+    this.applicationConfig = applicationConfig;
+    this.appOptions = appOptions;
+    this.httpServer = httpServer;
+
+    this.injector = new Injector({
+      preview: container.contextOptions?.preview!,
+      instanceDecorator: container.contextOptions?.instrument?.instanceDecorator,
+    });
+
+    const exceptionFiltersContext = new ExceptionFiltersContext(container);
+    const contextCreator = this.getContextCreator(
+      container, applicationConfig, exceptionFiltersContext,
+    );
+    const serverProvider = new SocketServerProvider(
+      this.socketsContainer, applicationConfig,
+    );
+    this.webSocketsController = new WebSocketsController(
+      serverProvider, applicationConfig, contextCreator, container,
+      this.injector, exceptionFiltersContext, graphInspector, this.appOptions,
+    );
+    const modules = container.getModules();
+    return Promise.all(
+      iterate(modules.entries())
+        .map(([moduleName, { providers }]) =>
+          this.connectAllGateways(providers, moduleName),
+        )
+        .toArray(),
+    );
+  }
+}
+```
+
+Before a gateway is connected, the adapter is lazily initialized once via `initializeAdapter`. If no adapter was explicitly configured, `loadAdapter` dynamically imports `@nestjs/platform-socket.io` and instantiates `IoAdapter` with the underlying HTTP server.
+
+## Connecting a Gateway to the Server
+
+`WebSocketsController.connectGatewayToServer` is the entry point for every gateway. It supports two overloads: one accepting an `InstanceWrapper` and module key (used by `SocketModule`), and one accepting an instance, metatype, module key and wrapper ID (used internally). It reads the `@WebSocketGateway` metadata, validates the port and delegates to `subscribeToServerEvents`.
+
+```ts packages/websockets/web-sockets-controller.ts
+public connectGatewayToServer(
+  instanceWrapper: InstanceWrapper<NestGateway>,
+  moduleKey: string,
+): void;
+public connectGatewayToServer(
+  instance: NestGateway,
+  metatype: Type<unknown> | Function,
+  moduleKey: string,
+  instanceWrapperId: string,
+): void;
+// implementation normalizes arguments then:
+const gatewayMetatype = metatype ?? instance.constructor;
+const options = Reflect.getMetadata(GATEWAY_OPTIONS, gatewayMetatype) || {};
+const port = Reflect.getMetadata(PORT_METADATA, gatewayMetatype) || 0;
+
+if (!Number.isInteger(port)) {
+  throw new InvalidSocketPortException(port, gatewayMetatype);
+}
+this.subscribeToServerEvents(
+  instanceWrapper, options, port, targetModuleKey, targetInstanceWrapperId,
+);
+```
+
+The gateway metadata interface defines options such as `namespace`, `path` and transport-specific settings. Each gateway can listen on a different port or share an existing server.
+
+## SocketServerProvider and SocketsContainer
+
+`SocketServerProvider.scanForSocketServer` decides whether to create a new server or reuse an existing one based on the hashed configuration (`port` plus `path`).
+
+```ts packages/websockets/socket-server-provider.ts
+public scanForSocketServer<T extends GatewayMetadata = any>(
+  options: T,
+  port: number,
+): ServerAndEventStreamsHost {
+  const serverAndStreamsHost = this.socketsContainer.getOneByConfig({
+    port,
+    path: options.path,
+  });
+  if (serverAndStreamsHost && options.namespace) {
+    return this.decorateWithNamespace(options, port, serverAndStreamsHost.server);
+  }
+  return serverAndStreamsHost
+    ? serverAndStreamsHost
+    : this.createSocketServer(options, port);
+}
+```
+
+`SocketsContainer` hashes the configuration with `object-hash` and stores a `ServerAndEventStreamsHost` per unique key. This allows multiple gateways to reuse the same underlying server while still supporting namespaces.
+
+## Event Subscription Pipeline
+
+Once a server is available, `subscribeEvents` wires three lifecycle subjects (`init`, `connection`, `disconnect`) and binds the client-connect handler through the adapter.
+
+```ts packages/websockets/web-sockets-controller.ts
+public subscribeEvents(
+  instanceWrapper: InstanceWrapper<NestGateway>,
+  subscribersMap: MessageMappingProperties[],
+  observableServer: ServerAndEventStreamsHost,
+  connectionHandler?: Function,
+  disconnectHandler?: Function,
+) {
+  const { instance } = instanceWrapper;
+  const { init, disconnect, connection, server } = observableServer;
+  const adapter = this.config.getIoAdapter();
+
+  this.subscribeInitEvent(instance, init);
+  this.subscribeConnectionEvent(connectionHandler, connection);
+  this.subscribeDisconnectEvent(disconnectHandler, disconnect);
+
+  const handler = this.getConnectionHandler(
+    this, instance, subscribersMap, disconnect, connection,
+  );
+  adapter.bindClientConnect(server, handler);
+  this.printSubscriptionLogs(instance, subscribersMap);
+}
+```
+
+The connection handler emits the `connection` subject, subscribes message handlers to the client and registers a disconnect hook that emits the `disconnect` subject. `subscribeMessages` maps each method decorated with `@SubscribeMessage` to a message handler and delegates to `adapter.bindMessageHandlers`.
+
+```ts packages/websockets/web-sockets-controller.ts
+public subscribeMessages<T = any>(
+  subscribersMap: MessageMappingProperties[],
+  client: T,
+  instance: NestGateway,
+) {
+  const adapter = this.config.getIoAdapter();
+  const handlers = subscribersMap.map(
+    ({ callback, message, isAckHandledManually }) => ({
+      message,
+      callback: callback.bind(instance, client),
+      isAckHandledManually,
+    }),
+  );
+  adapter.bindMessageHandlers(client, handlers, data =>
+    fromPromise(this.pickResult(data)).pipe(mergeAll()),
+  );
+}
+```
+
+## GatewayMetadataExplorer
+
+`GatewayMetadataExplorer` uses `MetadataScanner` to find `@SubscribeMessage` methods and `@WebSocketServer` properties on a gateway instance.
+
+```ts packages/websockets/gateway-metadata-explorer.ts
+public explore(instance: NestGateway): MessageMappingProperties[] {
+  const instancePrototype = Object.getPrototypeOf(instance);
+  return this.metadataScanner
+    .getAllMethodNames(instancePrototype)
+    .map(method => this.exploreMethodMetadata(instancePrototype, method)!)
+    .filter(metadata => metadata);
+}
+
+public exploreMethodMetadata(
+  instancePrototype: object,
+  methodName: string,
+): MessageMappingProperties | null {
+  const callback = instancePrototype[methodName];
+  const isMessageMapping = Reflect.getMetadata(
+    MESSAGE_MAPPING_METADATA, callback,
+  );
+  if (isUndefined(isMessageMapping)) {
+    return null;
+  }
+  const message = Reflect.getMetadata(MESSAGE_METADATA, callback);
+  const isAckHandledManually = this.hasAckDecorator(instancePrototype, methodName);
+  return { callback, message, methodName, isAckHandledManually };
+}
+```
+
+`scanForServerHooks` iterates properties and yields any key marked with `GATEWAY_SERVER_METADATA`, which is how `@WebSocketServer` works.
+
+## Adapters: AbstractWsAdapter, IoAdapter and WsAdapter
+
+The adapter abstraction lets Nest support multiple WebSocket libraries without changing gateway code.
+
+### AbstractWsAdapter
+
+`AbstractWsAdapter` in `packages/websockets/adapters/ws-adapter.ts` defines the contract:
+
+```ts packages/websockets/adapters/ws-adapter.ts
+export abstract class AbstractWsAdapter<
+  TServer extends BaseWsInstance = any,
+  TClient extends BaseWsInstance = any,
+  TOptions = any,
+> implements WebSocketAdapter<TServer, TClient, TOptions> {
+  public bindClientConnect(server: TServer, callback: Function) {
+    server.on(CONNECTION_EVENT, callback);
+  }
+  public bindClientDisconnect(client: TClient, callback: Function) {
+    if (typeof (client as any).once === 'function') {
+      (client as any).once(DISCONNECT_EVENT, callback);
+      return;
+    }
+    client.on(DISCONNECT_EVENT, callback);
+  }
+  public abstract create(port: number, options?: TOptions): TServer;
+  public abstract bindMessageHandlers(
+    client: TClient,
+    handlers: WsMessageHandler[],
+    transform: (data: any) => Observable<any>,
+  );
+}
+```
+
+The constructor detects whether it receives a `NestApplication` (and extracts its HTTP server) or a raw HTTP server object.
+
+### IoAdapter (Socket.IO)
+
+`IoAdapter` in `packages/platform-socket.io/adapters/io-adapter.ts` implements the contract for Socket.IO. Its `create` method returns a `Server` or a `Namespace`. `bindMessageHandlers` uses RxJS `fromEvent` to create an observable per message, transforms payloads with `mapPayload`, and handles acknowledgements.
+
+<Note>
+  `IoAdapter.mapPayload` distinguishes between data-only payloads and payloads that include an acknowledgement function. It also supports array payloads where the last element is the ack.
+</Note>
+
+### WsAdapter (native WebSocket)
+
+`WsAdapter` in `packages/platform-ws/adapters/ws-adapter.ts` implements the contract for the `ws` package. It manages its own HTTP server registry and upgrade listeners. When created with `port === 0`, it attaches to the existing HTTP server using `noServer: true` and routes upgrades by path.
+
+<Warning>
+  `WsAdapter` explicitly throws if you try to use namespaces because the `ws` package does not support them natively.
+</Warning>
+
+## WsContextCreator: Building the Execution Pipeline
+
+`WsContextCreator` mirrors the HTTP execution pipeline but for WebSocket messages. It collects metadata, resolves parameters, applies pipes, runs guards and interceptors, and proxies the final callback through `WsProxy`.
+
+```ts packages/websockets/context/ws-context-creator.ts
+public create(
+  instance: Controller,
+  callback: (...args: unknown[]) => void,
+  moduleKey: string,
+  methodName: string,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): (...args: any[]) => Promise<void> {
+  const contextType: ContextType = 'ws';
+  const { argsLength, paramtypes, getParamsMetadata } = this.getMetadata(
+    instance, methodName, contextType,
+  );
+  // exception filters, pipes, guards, interceptors created here
+  return this.wsProxy.create(
+    async (...args: unknown[]) => {
+      // ... runs guards, interceptors, pipes, then callback
+    },
+    exceptionHandler,
+    targetPattern,
+  );
+}
+```
+
+Parameter extraction uses `WsParamsFactory`, which maps paramtypes such as `WsParamtype.PAYLOAD`, `WsParamtype.SOCKET` and `WsParamtype.ACK` to the correct argument position.
+
+## Exceptions and Filters
+
+WebSocket exceptions use `WsException` and `BaseWsExceptionFilter`.
+
+```ts packages/websockets/errors/ws-exception.ts
+export class WsException extends Error {
+  constructor(private readonly error: string | object) {
+    super();
+    this.initMessage();
+  }
+  public getError(): string | object {
+    return this.error;
+  }
+}
+```
+
+`BaseWsExceptionFilter` emits an `exception` event back to the client. It supports both Socket.IO (`emit`) and native WebSocket (`send`) by checking for `readyState`. The filter can optionally include the causing pattern and data via `causeFactory`.
+
+```ts packages/websockets/exceptions/base-ws-exception-filter.ts
+public catch(exception: TError, host: ArgumentsHost) {
+  const client = host.switchToWs().getClient();
+  const pattern = host.switchToWs().getPattern();
+  const data = host.switchToWs().getData();
+  this.handleError(client, exception, { pattern, data });
+}
+```
+
+`WsExceptionsHandler` extends `BaseWsExceptionFilter` and adds support for custom `@UseFilters` filters via `invokeCustomFilters`.
+
+## Lifecycle Hooks
+
+Gateways can implement three optional lifecycle interfaces:
+
+| Interface | Method | Trigger |
+| --- | --- | --- |
+| `OnGatewayInit` | `afterInit(server)` | Server creation, bound to the `init` ReplaySubject |
+| `OnGatewayConnection` | `handleConnection(client, ...args)` | Client connection event |
+| `OnGatewayDisconnect` | `handleDisconnect(client, reason?)` | Client disconnect event |
+
+In `WebSocketsController`, these are bound to RxJS subjects so multiple gateways can share the same server but still receive independent lifecycle notifications.
+
+## Request-Scoped Gateways
+
+When a gateway is not dependency-tree static, `createRequestScopedHandler` loads a per-context instance via `Injector.loadPerContext` and creates a new `WsContextCreator` proxy for each request. The context ID is derived from the socket client object using `ContextIdFactory.getByRequest`.
+
+## Example Gateway
+
+The following example is modeled on the integration tests in `integration/websockets/src/app.gateway.ts`:
+
+```ts
+import {
+  WebSocketGateway,
+  SubscribeMessage,
+  MessageBody,
+} from '@nestjs/websockets';
+
+@WebSocketGateway(8080)
+export class ApplicationGateway {
+  @SubscribeMessage('push')
+  onPush(@MessageBody() data: any) {
+    return {
+      event: 'pop',
+      data,
+    };
+  }
+}
+```
+
+When the application starts, `SocketModule` detects the gateway, initializes the `IoAdapter`, creates a Socket.IO server on port 8080 and binds the `push` message to the `onPush` method. The returned object shape `{ event, data }` is recognized by `IoAdapter.bindMessageHandlers` and emitted back to the client via `socket.emit(event, data)`.
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/websockets/socket-module.ts` | Top-level registration, adapter initialization, orchestration |
+| `packages/websockets/web-sockets-controller.ts` | Gateway-to-server connection, event subscription, message routing |
+| `packages/websockets/gateway-metadata-explorer.ts` | Discovers `@SubscribeMessage` methods and `@WebSocketServer` properties |
+| `packages/websockets/socket-server-provider.ts` | Creates or reuses socket servers by configuration hash |
+| `packages/websockets/sockets-container.ts` | Stores `ServerAndEventStreamsHost` instances keyed by hash |
+| `packages/websockets/context/ws-context-creator.ts` | Builds the guards, pipes, interceptors and proxy for each handler |
+| `packages/websockets/context/ws-proxy.ts` | Wraps handler execution with exception handling |
+| `packages/websockets/exceptions/base-ws-exception-filter.ts` | Default exception filter for WebSocket errors |
+| `packages/websockets/exceptions/ws-exceptions-handler.ts` | Custom filter resolution and delegation |
+| `packages/websockets/adapters/ws-adapter.ts` | Abstract adapter base |
+| `packages/platform-socket.io/adapters/io-adapter.ts` | Socket.IO adapter implementation |
+| `packages/platform-ws/adapters/ws-adapter.ts` | Native `ws` adapter implementation |
+| `packages/websockets/decorators/socket-gateway.decorator.ts` | `@WebSocketGateway` decorator |
+| `packages/websockets/decorators/subscribe-message.decorator.ts` | `@SubscribeMessage` decorator |
+| `packages/websockets/decorators/message-body.decorator.ts` | `@MessageBody` parameter decorator |
+| `packages/websockets/decorators/connected-socket.decorator.ts` | `@ConnectedSocket` parameter decorator |
+| `packages/websockets/decorators/gateway-server.decorator.ts` | `@WebSocketServer` property decorator |

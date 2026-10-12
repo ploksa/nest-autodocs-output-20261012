@@ -1,0 +1,470 @@
+---
+title: "Exception Filter Resolution and Catch Hierarchy"
+description: "How Nest builds exception filter chains, how ExceptionsHandler selects a matching filter, and how BaseExceptionFilter responds to HTTP and unknown errors."
+sidebarTitle: "Exception Filters"
+---
+
+When an error occurs inside a route handler, guard, pipe, or interceptor, Nest routes it through an exception filter chain. The chain is built per route by `RouterExceptionFilters` and executed by `ExceptionsHandler` to determine whether the error is handled by a custom filter or falls through to the default behavior. This page explains how filters are gathered, ordered, matched against exception types, and ultimately resolved into an HTTP response.
+
+## The ExceptionFilter Interface
+
+A custom filter implements the `ExceptionFilter` interface defined in `packages/common/interfaces/exceptions/exception-filter.interface.ts`:
+
+```ts packages/common/interfaces/exceptions/exception-filter.interface.ts
+export interface ExceptionFilter<T = any> {
+  catch(exception: T, host: ArgumentsHost): any;
+}
+```
+
+The `host` argument provides access to the request-specific arguments array so the filter can inspect or modify the response. Filters are associated with specific exception types through the `@Catch` decorator.
+
+## Registering Filters
+
+Filters can be registered globally, controller-scoped, or method-scoped, and they can also be provided through `APP_FILTER` as a provider token.
+
+### The @Catch Decorator
+
+`@Catch` is defined in `packages/common/decorators/core/catch.decorator.ts` and attaches two pieces of metadata to the decorated class.
+
+```ts packages/common/decorators/core/catch.decorator.ts
+export function Catch(
+  ...exceptions: Array<Type<any> | Abstract<any>>
+): ClassDecorator {
+  return (target: object) => {
+    Reflect.defineMetadata(CATCH_WATERMARK, true, target);
+    Reflect.defineMetadata(FILTER_CATCH_EXCEPTIONS, exceptions, target);
+  };
+}
+```
+
+- `CATCH_WATERMARK` marks the class as a filter type.
+- `FILTER_CATCH_EXCEPTIONS` stores the array of exception classes this filter should handle. An empty array means the filter catches every exception.
+
+### The @UseFilters Decorator
+
+`@UseFilters` binds filters to a controller or handler method.
+
+```ts packages/common/decorators/core/exception-filters.decorator.ts
+export const UseFilters = (...filters: (ExceptionFilter | Function)[]) =>
+  addExceptionFiltersMetadata(...filters);
+
+function addExceptionFiltersMetadata(
+  ...filters: (Function | ExceptionFilter)[]
+): MethodDecorator & ClassDecorator {
+  return (target, key, descriptor) => {
+    if (descriptor) {
+      extendArrayMetadata(EXCEPTION_FILTERS_METADATA, filters, descriptor.value);
+      return descriptor;
+    }
+    extendArrayMetadata(EXCEPTION_FILTERS_METADATA, filters, target);
+    return target;
+  };
+}
+```
+
+### Global Registration
+
+Global filters are registered with `app.useGlobalFilters(...)`. Filters registered as provider tokens via `APP_FILTER` are resolved as injectable providers by the dependency injection system and participate in scoped lifecycles.
+
+## Building the Filter Chain: RouterExceptionFilters
+
+`RouterExceptionFilters` in `packages/core/router/router-exception-filters.ts` is the entry point for building an `ExceptionsHandler` per route.
+
+```ts packages/core/router/router-exception-filters.ts
+export class RouterExceptionFilters extends BaseExceptionFilterContext {
+  constructor(
+    container: NestContainer,
+    private readonly config: ApplicationConfig,
+    private readonly applicationRef: HttpServer,
+  ) {
+    super(container);
+  }
+
+  public create(
+    instance: Controller,
+    callback: RouterProxyCallback,
+    moduleKey: string | undefined,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
+  ): ExceptionsHandler {
+    this.moduleContext = moduleKey!;
+
+    const exceptionHandler = new ExceptionsHandler(this.applicationRef);
+    const filters = this.createContext(
+      instance,
+      callback,
+      EXCEPTION_FILTERS_METADATA,
+      contextId,
+      inquirerId,
+    );
+    if (isEmptyArray(filters)) {
+      return exceptionHandler;
+    }
+    exceptionHandler.setCustomFilters(filters.reverse());
+    return exceptionHandler;
+  }
+}
+```
+
+The `create` method:
+
+1. Creates an `ExceptionsHandler` initialized with the application HTTP adapter
+2. Calls `createContext` on the base class to gather custom filter metadata from global, controller, and method levels
+3. If custom filters exist, reverses their order and passes them to `ExceptionsHandler.setCustomFilters`
+
+### Why Filters Are Reversed
+
+The framework resolves filter metadata in global, controller, method order. Because the runtime iterates from first to last, reversing the array at the end places method-level filters first, then controller-level, then global. This means the most specific filter wins, and the first matching filter in the reversed array handles the exception.
+
+### Global Filter Metadata
+
+`getGlobalMetadata` resolves both static global filters and scoped `APP_FILTER` providers:
+
+```ts packages/core/router/router-exception-filters.ts
+public getGlobalMetadata<T extends unknown[]>(
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): T {
+  const globalFilters = this.config.getGlobalFilters() as T;
+  if (contextId === STATIC_CONTEXT && !inquirerId) {
+    return globalFilters;
+  }
+  const scopedFilterWrappers =
+    this.config.getGlobalRequestFilters() as InstanceWrapper[];
+  const scopedFilters = iterate(scopedFilterWrappers)
+    .map(wrapper => wrapper.getInstanceByContextId(contextId, inquirerId))
+    .filter(host => !!host)
+    .map(host => host.instance)
+    .toArray();
+  return globalFilters.concat(scopedFilters) as T;
+}
+```
+
+## BaseExceptionFilterContext: Concrete Filter Resolution
+
+`BaseExceptionFilterContext` in `packages/core/exceptions/base-exception-filter-context.ts` extends `ContextCreator` and turns raw metadata into an array of `{ func, exceptionMetatypes }` objects.
+
+```ts packages/core/exceptions/base-exception-filter-context.ts
+export class BaseExceptionFilterContext extends ContextCreator {
+  public createConcreteContext<T extends any[], R extends any[]>(
+    metadata: T,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
+  ): R {
+    if (isEmpty(metadata)) {
+      return [] as any[] as R;
+    }
+    return iterate(metadata)
+      .filter(
+        instance => instance && (isFunction(instance.catch) || instance.name),
+      )
+      .map(filter => this.getFilterInstance(filter, contextId, inquirerId))
+      .filter(item => !!item)
+      .map(instance => ({
+        func: instance!.catch.bind(instance),
+        exceptionMetatypes: this.reflectCatchExceptions(instance!),
+      }))
+      .toArray() as R;
+  }
+}
+```
+
+For each entry, it instantiates the class if necessary, pre-binds the `catch` method to its instance, and reads `@Catch` metadata off the constructor. The result is consumed as `ExceptionFilterMetadata`.
+
+## Running the Filter Chain: ExceptionsHandler
+
+`ExceptionsHandler` in `packages/core/exceptions/exceptions-handler.ts` is the actual dispatcher. It stores processed custom filters and decides whether to invoke them or fall back to `BaseExceptionFilter`.
+
+```ts packages/core/exceptions/exceptions-handler.ts
+export class ExceptionsHandler extends BaseExceptionFilter {
+  private filters: ExceptionFilterMetadata[] = [];
+
+  public next(exception: Error | HttpException, ctx: ArgumentsHost) {
+    if (this.invokeCustomFilters(exception, ctx)) {
+      return;
+    }
+    super.catch(exception, ctx);
+  }
+
+  public invokeCustomFilters<T = any>(
+    exception: T,
+    ctx: ArgumentsHost,
+  ): boolean {
+    if (isEmptyArray(this.filters)) {
+      return false;
+    }
+
+    const filter = selectExceptionFilterMetadata(this.filters, exception);
+    filter && filter.func(exception, ctx);
+    return !!filter;
+  }
+}
+```
+
+`next` is called by `RouterProxy.createProxy` when a route throws an error. It tries custom filters first, then delegates to the base implementation.
+
+## Selecting the Right Filter
+
+`selectExceptionFilterMetadata` in `packages/common/utils/select-exception-filter-metadata.util.ts` finds the first filter whose `@Catch` list includes the thrown exception type or is empty.
+
+```ts packages/common/utils/select-exception-filter-metadata.util.ts
+export const selectExceptionFilterMetadata = <T = any>(
+  filters: ExceptionFilterMetadata[],
+  exception: T,
+): ExceptionFilterMetadata | undefined =>
+  filters.find(
+    ({ exceptionMetatypes }) =>
+      !exceptionMetatypes.length ||
+      exceptionMetatypes.some(
+        ExceptionMetaType => exception instanceof ExceptionMetaType,
+      ),
+  );
+```
+
+- If `exceptionMetatypes` is empty, the filter catches everything.
+- Otherwise, it catches only exceptions that are instances of one of the listed types.
+- The first matching filter wins, and later filters are ignored.
+
+## BaseExceptionFilter: The Default Catcher
+
+`BaseExceptionFilter` in `packages/core/exceptions/base-exception-filter.ts` handles any exception that does not match a custom filter. Its `catch` method distinguishes between `HttpException` and everything else.
+
+### Handling HttpException
+
+When the exception is an instance of `HttpException`, `BaseExceptionFilter` calls `getResponse()` to retrieve the response body and `getStatus()` for the status code.
+
+```ts packages/core/exceptions/base-exception-filter.ts
+public catch(exception: T, host: ArgumentsHost) {
+  const applicationRef =
+    this.applicationRef ||
+    (this.httpAdapterHost && this.httpAdapterHost.httpAdapter)!;
+
+  if (!(exception instanceof HttpException)) {
+    return this.handleUnknownError(exception, host, applicationRef);
+  }
+  const res = exception.getResponse();
+  const message = isObject(res)
+    ? res
+    : {
+        statusCode: exception.getStatus(),
+        message: res,
+        ...(exception.errorCode !== undefined && {
+          errorCode: exception.errorCode,
+        }),
+        ...(exception.errorCode !== undefined && {
+          errorCode: exception.errorCode,
+        }),
+      };
+
+  const response = host.getArgByIndex(1);
+  if (!applicationRef.isHeadersSent(response)) {
+    applicationRef.reply(response, message, exception.getStatus());
+  } else {
+    applicationRef.end(response);
+  }
+}
+```
+
+If headers have already been sent, it safely calls `end` on the response instead of trying to write more data.
+
+### Handling Unknown Errors
+
+For non-HttpException errors, `handleUnknownError` produces a 500 or maps common HTTP error shapes:
+
+```ts packages/core/exceptions/base-exception-filter.ts
+public handleUnknownError(
+  exception: T,
+  host: ArgumentsHost,
+  applicationRef: AbstractHttpAdapter | HttpServer,
+) {
+  const body = this.isHttpError(exception)
+    ? {
+        statusCode: exception.statusCode,
+        message: exception.message,
+      }
+    : {
+        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+        message: MESSAGES.UNKNOWN_EXCEPTION_MESSAGE,
+      };
+
+  const response = host.getArgByIndex(1);
+  if (!applicationRef.isHeadersSent(response)) {
+    applicationRef.reply(response, body, body.statusCode);
+  } else {
+    applicationRef.end(response);
+  }
+
+  if (!(exception instanceof IntrinsicException)) {
+    BaseExceptionFilter.logger.error(exception);
+  }
+}
+```
+
+`isHttpError` detects Fastify errors, `http-errors` instances, and plain objects with a `statusCode` property. `IntrinsicException` subclasses are intentionally not logged so the framework can throw internally without flooding logs.
+
+## ExternalExceptionFilter and ExternalExceptionsHandler
+
+`ExternalExceptionFilter` in `packages/core/exceptions/external-exception-filter.ts` is used in contexts outside the standard HTTP router, such as microservice entry points. It provides a minimal fallback that logs the error unless it is an `IntrinsicException`, then rethrows it.
+
+```ts packages/core/exceptions/external-exception-filter.ts
+export class ExternalExceptionFilter<T = any, R = any> {
+  private static readonly logger = new Logger('ExceptionsHandler');
+
+  catch(exception: T, host: ArgumentsHost): R | Promise<R> {
+    if (
+      exception instanceof Error &&
+      !(exception instanceof IntrinsicException)
+    ) {
+      ExternalExceptionFilter.logger.error(exception);
+    }
+
+
+    throw exception;
+  }
+}
+```
+
+`ExternalExceptionsHandler` in `packages/core/exceptions/external-exceptions-handler.ts` extends this behavior with support for custom filters, similar to how `ExceptionsHandler` extends `BaseExceptionFilter`.
+
+```ts packages/core/exceptions/external-exceptions-handler.ts
+export class ExternalExceptionsHandler extends ExternalExceptionFilter {
+  public next(exception: Error, host: ArgumentsHost): Promise<any> {
+    const result = this.invokeCustomFilters(exception, host);
+    if (result) {
+      return result;
+    }
+    return super.catch(exception, host);
+  }
+}
+```
+
+`ExternalExceptionFilterContext` in `packages/core/exceptions/external-exception-filter-context.ts` builds the custom filter chain for external contexts using the same base metadata logic as `RouterExceptionFilters`.
+
+## HttpException and Built-in Exceptions
+
+`HttpException` in `packages/common/exceptions/http.exception.ts` is the base class for all HTTP exceptions in Nest. It stores a response body, HTTP status code, optional `cause`, and optional `errorCode`.
+
+```ts packages/common/exceptions/http.exception.ts
+export class HttpException extends IntrinsicException {
+  constructor(
+    private readonly response: string | Record<string, any>,
+    private readonly status: number,
+    private readonly options?: HttpExceptionOptions,
+  ) {
+    super();
+    this.initMessage();
+    this.initName();
+    this.initCause();
+    this.initErrorCode();
+  }
+
+  public getResponse(): string | object {
+    return this.response;
+  }
+
+  public getStatus(): number {
+    return this.status;
+  }
+}
+```
+
+`HttpException.createBody` generates the JSON payload, and derived classes provide semantic constructors for common HTTP error codes. Built-in exceptions in `packages/common/exceptions/` include:
+
+| Exception | Status |
+| --- | --- |
+| `BadRequestException` | 400 |
+| `UnauthorizedException` | 401 |
+| `ForbiddenException` | 403 |
+| `NotFoundException` | 404 |
+| `NotAcceptableException` | 406 |
+| `RequestTimeoutException` | 408 |
+| `ConflictException` | 409 |
+| `GoneException` | 410 |
+| `PayloadTooLargeException` | 413 |
+| `UnsupportedMediaTypeException` | 415 |
+| `UnprocessableEntityException` | 422 |
+| `InternalServerErrorException` | 500 |
+| `NotImplementedException` | 501 |
+| `BadGatewayException` | 502 |
+| `ServiceUnavailableException` | 503 |
+| `GatewayTimeoutException` | 504 |
+| `HttpVersionNotSupportedException` | 505 |
+
+`IntrinsicException` is the root class for exceptions that should not be logged by the default filter. `HttpException` extends it, so if a handler throws `HttpException`, the default filter does not log it as an unhandled error.
+
+## Example: A Custom Exception Filter
+
+Below is a complete custom filter that catches a specific domain exception and formats a consistent error response.
+
+```ts
+import { ExceptionFilter, Catch, ArgumentsHost, HttpStatus } from '@nestjs/common';
+import { Response } from 'express';
+
+class DomainValidationError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+  }
+}
+
+@Catch(DomainValidationError)
+export class DomainValidationFilter implements ExceptionFilter<DomainValidationError> {
+  catch(exception: DomainValidationError, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+
+    response.status(HttpStatus.BAD_REQUEST).json({
+      statusCode: HttpStatus.BAD_REQUEST,
+      errorCode: exception.code,
+      message: exception.message,
+    });
+  }
+}
+```
+
+Usage:
+
+```ts
+@Controller('orders')
+@UseFilters(DomainValidationFilter)
+export class OrdersController {
+  @Post()
+  create() {
+    throw new DomainValidationError('INVALID_QUANTITY', 'Quantity must be positive');
+  }
+}
+```
+
+When `DomainValidationError` is thrown, `ExceptionsHandler.invokeCustomFilters` selects `DomainValidationFilter` via `selectExceptionFilterMetadata`, and the filter's `catch` method sends the formatted JSON response.
+
+## Filter Ordering Summary
+
+1. **Method-level** filters are checked first (most specific)
+2. **Controller-level** filters are checked second
+3. **Global** filters (including `APP_FILTER` providers) are checked last
+4. The first filter whose `@Catch` list matches the thrown exception handles it
+5. If no custom filter matches, `BaseExceptionFilter` catches the error
+6. `BaseExceptionFilter` sends the response using the HTTP adapter and logs non-intrinsic exceptions
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/core/router/router-exception-filters.ts` | Builds the `ExceptionsHandler` per route and resolves custom filter metadata. |
+| `packages/core/exceptions/base-exception-filter-context.ts` | Resolves filter instances and extracts `@Catch` metadata into executable filter entries. |
+| `packages/core/exceptions/exceptions-handler.ts` | Dispatches to the first matching custom filter or falls back to `BaseExceptionFilter`. |
+| `packages/core/exceptions/base-exception-filter.ts` | Default filter that handles `HttpException`, unknown errors, and HTTP-error-shaped objects. |
+| `packages/core/exceptions/external-exception-filter.ts` | Minimal fallback for non-HTTP contexts; logs and rethrows. |
+| `packages/core/exceptions/external-exceptions-handler.ts` | Adds custom filter support on top of `ExternalExceptionFilter`. |
+| `packages/core/exceptions/external-exception-filter-context.ts` | Builds the external filter chain for microservice and non-HTTP contexts. |
+| `packages/common/interfaces/exceptions/exception-filter.interface.ts` | Defines the `ExceptionFilter` interface contract. |
+| `packages/common/decorators/core/catch.decorator.ts` | The `@Catch` decorator that binds exception types to a filter class. |
+| `packages/common/decorators/core/exception-filters.decorator.ts` | The `@UseFilters` decorator that attaches filters to controllers and methods. |
+| `packages/common/exceptions/http.exception.ts` | Base `HttpException` class with `getResponse`, `getStatus`, and `createBody`. |
+| `packages/common/exceptions/intrinsic.exception.ts` | Root class for exceptions that should not be logged by default. |
+| `packages/common/utils/select-exception-filter-metadata.util.ts` | Finds the first matching filter based on `instanceof` checks of `@Catch` metadata. |
+
+## See Also
+
+- [Guards](/http/guards) for how access control failures become exceptions
+- [Pipes](/http/pipes) for how pipe errors enter the exception filter chain
+- [Interceptors](/http/interceptors) for how errors in the Observable chain are propagated to filters

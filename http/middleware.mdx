@@ -1,0 +1,509 @@
+---
+title: "Nest HTTP Middleware Registration and Adapter Binding"
+sidebarTitle: "Middleware"
+description: "Learn how Nest registers and executes middleware classes and functions, resolves request-scoped instances, and binds them to the HTTP adapter."
+---
+
+Nest middleware runs before route handlers and can modify the request, response, or short-circuit the pipeline. Internally, middleware registration is driven by `MiddlewareModule`, configured through module-level `configure` methods, and bound to the HTTP adapter through a dedicated pipeline separate from controller routes. This page covers the full flow from module configuration to adapter binding.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/middleware/middleware-module.ts` | Orchestrates middleware discovery, resolution, and adapter registration |
+| `packages/core/middleware/builder.ts` | `MiddlewareBuilder` with inner `ConfigProxy` for `.apply(...).forRoutes(...)` |
+| `packages/core/middleware/container.ts` | Stores middleware configurations and `InstanceWrapper` collections per module |
+| `packages/core/middleware/resolver.ts` | Resolves middleware instances via `Injector.loadMiddleware` |
+| `packages/core/middleware/routes-mapper.ts` | Maps controller classes and path strings to `RouteInfo` objects |
+| `packages/core/middleware/route-info-path-extractor.ts` | Extracts final paths from `RouteInfo`, including versioning and global prefix |
+| `packages/core/middleware/utils.ts` | `filterMiddleware`, `isMiddlewareClass`, `mapToClass`, route exclusion logic |
+| `packages/common/interfaces/modules/nest-module.interface.ts` | `NestModule.configure(consumer)` interface |
+
+## How middleware is declared
+
+A module implements `NestModule` and uses the `configure` method:
+
+```ts
+export interface NestModule {
+  configure(consumer: MiddlewareConsumer);
+}
+```
+
+`MiddlewareConsumer` is implemented by `MiddlewareBuilder`:
+
+```ts
+export interface MiddlewareConsumer {
+  apply(...middleware: (Type<any> | Function)[]): MiddlewareConfigProxy;
+}
+
+export interface MiddlewareConfigProxy {
+  exclude(...routes: (string | RouteInfo)[]): MiddlewareConfigProxy;
+  forRoutes(...routes: (string | Type<any> | RouteInfo)[]): MiddlewareConsumer;
+}
+```
+
+In practice:
+
+```ts
+@Module({})
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply(LoggerMiddleware)
+      .exclude({ path: 'health', method: RequestMethod.GET })
+      .forRoutes(UsersController);
+  }
+}
+```
+
+## Registration flow in the application lifecycle
+
+Middleware configuration happens during `registerModules()`, and middleware binding happens inside `registerRouter()`.
+
+`NestApplication.init()` calls them in this order:
+
+```ts packages/core/nest-application.ts
+await this.registerModules();
+await this.registerRouter();
+await this.callInitHook();
+await this.registerRouterHooks();
+```
+
+Inside `registerModules()`, `MiddlewareModule.register` creates a `MiddlewareBuilder` per module, calls each `configure` method, and asks `MiddlewareResolver` to resolve middleware instances.
+
+Inside `registerRouter()`, `NestApplication.registerMiddleware` calls `MiddlewareModule.registerMiddleware`, which binds proxies to the HTTP adapter. Only after all middleware is bound does `routesResolver.resolve()` register controller routes.
+
+This means middleware always runs before route handlers because it is registered on the adapter first.
+
+## MiddlewareModule.register
+
+`MiddlewareModule.register` initializes the pipeline for the application:
+
+```ts packages/core/middleware/middleware-module.ts
+public async register(
+  middlewareContainer: MiddlewareContainer,
+  container: NestContainer,
+  config: ApplicationConfig,
+  injector: Injector,
+  httpAdapter: HttpServer,
+  graphInspector: GraphInspector,
+  options: TAppOptions,
+) {
+  this.appOptions = options;
+
+  const appRef = container.getHttpAdapterRef();
+  this.routerExceptionFilter = new RouterExceptionFilters(
+    container,
+    config,
+    appRef,
+  );
+  this.routesMapper = new RoutesMapper(container, config);
+  this.resolver = new MiddlewareResolver(middlewareContainer, injector);
+  this.routeInfoPathExtractor = new RouteInfoPathExtractor(config);
+  this.injector = injector;
+  this.container = container;
+  this.httpAdapter = httpAdapter;
+  this.graphInspector = graphInspector;
+
+  const modules = container.getModules();
+  await this.resolveMiddleware(middlewareContainer, modules);
+}
+```
+
+It walks every module, calls `loadConfiguration`, then asks `MiddlewareResolver` to resolve instances.
+
+## MiddlewareBuilder and ConfigProxy
+
+`MiddlewareBuilder.apply(...)` returns a `ConfigProxy` that collects `.exclude(...)` and `.forRoutes(...)` calls:
+
+```ts packages/core/middleware/builder.ts
+public apply(
+  ...middleware: Array<Type<any> | Function | Array<Type<any> | Function>>
+): MiddlewareConfigProxy {
+  return new MiddlewareBuilder.ConfigProxy(
+    this, middleware.flat(), this.routeInfoPathExtractor,
+  );
+}
+```
+
+`ConfigProxy.forRoutes` maps every route argument to `RouteInfo` and removes overlapping routes. It then creates a `MiddlewareConfiguration` object and stores it in the builder's collection:
+
+```ts packages/core/middleware/builder.ts
+public forRoutes(...routes: Array<string | Type<any> | RouteInfo>): MiddlewareConsumer {
+  const { middlewareCollection } = this.builder;
+
+  const flattedRoutes = this.getRoutesFlatList(routes);
+  const forRoutes = this.removeOverlappedRoutes(flattedRoutes);
+  const configuration = {
+    middleware: filterMiddleware(this.middleware, this.excludedRoutes, this.builder.getHttpAdapter()),
+    forRoutes,
+  };
+  middlewareCollection.add(configuration);
+  return this.builder;
+}
+```
+
+### Overlapping route removal
+
+When a controller path and a parametric path overlap (like `/users/:id` and `/users/profile`), `removeOverlappedRoutes` drops the parametric one because it would otherwise shadow the specific route:
+
+```ts packages/core/middleware/builder.ts
+private removeOverlappedRoutes(routes: RouteInfo[]) {
+  const regexMatchParams = /(:[^/]*)/g;
+  const wildcard = '([^/]*)';
+  const routesWithRegex = routes
+    .filter(route => route.path.includes(':'))
+    .map(route => ({
+      method: route.method,
+      path: route.path,
+      regex: new RegExp('^(' + route.path.replace(regexMatchParams, wildcard) + ')$'),
+    }));
+
+  return routes.filter(route => {
+    const isOverlapped = (item): boolean => {
+      if (route.method !== item.method) return false;
+      const normalizedRoutePath = stripEndSlash(route.path);
+      return normalizedRoutePath !== item.path && item.regex.test(normalizedRoutePath);
+    };
+    const routeMatch = routesWithRegex.find(isOverlapped);
+    return routeMatch === undefined;
+  });
+}
+```
+
+## MiddlewareContainer
+
+`MiddlewareContainer` holds two maps:
+
+1. `middleware`: `Map<moduleKey, Map<token, InstanceWrapper>>`
+2. `configurationSets`: `Map<moduleKey, Set<MiddlewareConfiguration>>`
+
+When `insertConfig` is called, it creates an `InstanceWrapper` for each middleware class, preserving scope and durability metadata:
+
+```ts packages/core/middleware/container.ts
+public insertConfig(configList: MiddlewareConfiguration[], moduleKey: string) {
+  const middleware = this.getMiddlewareCollection(moduleKey);
+  const targetConfig = this.getTargetConfig(moduleKey)!;
+
+  const configurations = configList || [];
+  const insertMiddleware = <T extends Type<unknown>>(metatype: T) => {
+    const token = metatype;
+    middleware.set(token, new InstanceWrapper({
+      scope: getClassScope(metatype),
+      durable: isDurable(metatype),
+      name: token?.name ?? token,
+      metatype,
+      token,
+    }));
+  };
+  configurations.forEach(config => {
+    [].concat(config.middleware).map(insertMiddleware);
+    targetConfig.add(config);
+  });
+}
+```
+
+## Resolving instances
+
+`MiddlewareResolver` calls `Injector.loadMiddleware` for every wrapper in the collection. This brings the middleware instance to life with dependency injection, including request-scoped providers if necessary.
+
+```ts packages/core/middleware/resolver.ts
+public async resolveInstances(moduleRef: Module, moduleName: string) {
+  const middlewareMap = this.middlewareContainer.getMiddlewareCollection(moduleName);
+  const resolveInstance = async (wrapper: InstanceWrapper) =>
+    this.resolveMiddlewareInstance(wrapper, middlewareMap, moduleRef);
+  await Promise.all([...middlewareMap.values()].map(resolveInstance));
+}
+```
+
+## Binding handlers to the adapter
+
+`MiddlewareModule.registerMiddleware` sorts configurations by module distance, with global modules (distance `Number.MAX_VALUE`) placed first, and calls `registerMiddlewareConfig` for each:
+
+```ts packages/core/middleware/middleware-module.ts
+public async registerMiddleware(
+  middlewareContainer: MiddlewareContainer,
+  applicationRef: any,
+) {
+  const configs = middlewareContainer.getConfigurations();
+  const registerAllConfigs = async (
+    moduleKey: string,
+    middlewareConfig: MiddlewareConfiguration[],
+  ) => {
+    for (const config of middlewareConfig) {
+      await this.registerMiddlewareConfig(
+        middlewareContainer,
+        config,
+        moduleKey,
+        applicationRef,
+      );
+    }
+  };
+
+  const entriesSortedByDistance = [...configs.entries()].sort(
+    ([moduleA], [moduleB]) => {
+      const moduleARef = this.container.getModuleByKey(moduleA)!;
+      const moduleBRef = this.container.getModuleByKey(moduleB)!;
+      const isModuleAGlobal = moduleARef.distance === Number.MAX_VALUE;
+      const isModuleBGlobal = moduleBRef.distance === Number.MAX_VALUE;
+      if (isModuleAGlobal && isModuleBGlobal) {
+        return 0;
+      }
+      if (isModuleAGlobal) {
+        return -1;
+      }
+      if (isModuleBGlobal) {
+        return 1;
+      }
+      return moduleARef.distance - moduleBRef.distance;
+    },
+  );
+  for (const [moduleRef, moduleConfigurations] of entriesSortedByDistance) {
+    await registerAllConfigs(moduleRef, [...moduleConfigurations]);
+  }
+}
+```
+
+### bindHandler
+
+For each middleware class, `bindHandler` creates a proxy that wraps `instance.use` in exception handling:
+
+```ts packages/core/middleware/middleware-module.ts
+private async bindHandler(
+  wrapper: InstanceWrapper<NestMiddleware>,
+  applicationRef: HttpServer,
+  routeInfo: RouteInfo,
+  moduleRef: Module,
+  collection: Map<InjectionToken, InstanceWrapper>,
+) {
+  const { instance, metatype } = wrapper;
+  if (isUndefined(instance?.use)) {
+    throw new InvalidMiddlewareException(metatype!.name);
+  }
+  const isStatic = wrapper.isDependencyTreeStatic();
+  if (isStatic) {
+    const proxy = await this.createProxy(instance);
+    return this.registerHandler(applicationRef, routeInfo, proxy);
+  }
+
+  const isTreeDurable = wrapper.isDependencyTreeDurable();
+  await this.registerHandler(applicationRef, routeInfo, async (req, res, next) => {
+    try {
+      const contextId = this.getContextId(req, isTreeDurable);
+      const contextInstance = await this.injector.loadPerContext(
+        instance, moduleRef, collection, contextId,
+      );
+      const proxy = await this.createProxy(contextInstance, contextId);
+      return proxy(req, res, next);
+    } catch (err) {
+      let exceptionsHandler = this.exceptionFiltersCache.get(instance.use);
+      if (!exceptionsHandler) {
+        exceptionsHandler = this.routerExceptionFilter.create(
+          instance,
+          instance.use,
+          undefined,
+        );
+        this.exceptionFiltersCache.set(instance.use, exceptionsHandler);
+      }
+      const host = new ExecutionContextHost([req, res, next]);
+      exceptionsHandler.next(err, host);
+    }
+  });
+}
+```
+
+If the middleware is static, a single proxy is created once. If it has request-scoped dependencies, a fresh instance is resolved per request through `Injector.loadPerContext`, just like request-scoped controllers.
+
+### registerHandler
+
+The final step calls `applicationRef.createMiddlewareFactory(method)` to get an adapter-specific middleware registration function, then binds the proxy to the extracted paths:
+
+```ts packages/core/middleware/middleware-module.ts
+private async registerHandler(
+  applicationRef: HttpServer,
+  routeInfo: RouteInfo,
+  proxy: <TRequest, TResponse>(
+    req: TRequest,
+    res: TResponse,
+    next: () => void,
+  ) => void,
+) {
+  const { method } = routeInfo;
+  const paths = this.routeInfoPathExtractor.extractPathsFrom(routeInfo);
+  const isMethodAll = isRequestMethodAll(method);
+  const requestMethod = RequestMethod[method];
+  const router = await applicationRef.createMiddlewareFactory(method);
+  const middlewareFunction = isMethodAll
+    ? proxy
+    : <TRequest, TResponse>(
+        req: TRequest,
+        res: TResponse,
+        next: () => void,
+      ) => {
+        const actualRequestMethod = applicationRef.getRequestMethod?.(req);
+        if (
+          actualRequestMethod === requestMethod ||
+          (actualRequestMethod === RequestMethod[RequestMethod.HEAD] &&
+            requestMethod === RequestMethod[RequestMethod.GET])
+        ) {
+          return proxy(req, res, next);
+        }
+        return next();
+      };
+  const pathsToApplyMiddleware = [] as string[];
+  paths.some(path => path.match(/^\/?$/))
+    ? pathsToApplyMiddleware.push('/')
+    : pathsToApplyMiddleware.push(...paths);
+  pathsToApplyMiddleware.forEach(path => router(path, middlewareFunction));
+}
+```
+
+When the method is not `ALL`, Nest wraps the middleware in a method check so that, for example, a `POST`-only middleware does not run on `GET` requests.
+
+## Class-based vs functional middleware
+
+`filterMiddleware` in `utils.ts` normalizes middleware to a class with a `use` method:
+
+```ts packages/core/middleware/utils.ts
+export function isMiddlewareClass(middleware: any): middleware is Type<any> {
+  const middlewareStr = middleware.toString();
+  if (middlewareStr.substring(0, 5) === 'class') {
+    return true;
+  }
+  const middlewareArr = middlewareStr.split(' ');
+  return (
+    middlewareArr[0] === 'function' &&
+    /[A-Z]/.test(middlewareArr[1]?.[0]) &&
+    isFunction(middleware.prototype?.use)
+  );
+}
+```
+
+For plain functions, `mapToClass` generates an anonymous class whose `use` method delegates to the function:
+
+```ts packages/core/middleware/utils.ts
+return assignToken(
+  class {
+    use = (...params: unknown[]) => {
+      const [req, _, next] = params as [Record<string, any>, any, Function];
+      const isExcluded = isMiddlewareRouteExcluded(req, excludedRoutes, httpAdapter);
+      if (isExcluded) {
+        return next();
+      }
+      return (middleware as Function)(...params);
+    };
+  },
+);
+```
+
+The generated class is assigned a unique token so it can be stored as an `InstanceWrapper`.
+
+## Route exclusion
+
+When `.exclude(...)` is used, `filterMiddleware` wraps the middleware so it checks the excluded routes at runtime:
+
+```ts packages/core/middleware/utils.ts
+export const filterMiddleware = <T extends Function | Type<any> = any>(
+  middleware: T[],
+  routes: RouteInfo[],
+  httpAdapter: HttpServer,
+) => {
+  const excludedRoutes = mapToExcludeRoute(routes);
+  return iterate([])
+    .concat(middleware)
+    .filter(isFunction)
+    .map((item: T) => mapToClass(item, excludedRoutes, httpAdapter))
+    .toArray();
+};
+```
+
+`isMiddlewareRouteExcluded` reads the actual request method and pathname at runtime and matches them against the compiled exclusion regexes.
+
+## Versioning and prefixes in middleware paths
+
+`RouteInfoPathExtractor` handles global prefix, URI versioning, and wildcards when computing the actual paths to register:
+
+```ts packages/core/middleware/route-info-path-extractor.ts
+public extractPathsFrom({ path, method, version }: RouteInfo): string[] {
+  const versionPaths = this.extractVersionPathFrom(version);
+
+  if (this.isAWildcard(path)) {
+    const entries =
+      versionPaths.length > 0
+        ? versionPaths
+            .map(versionPath => [
+              this.prefixPath + versionPath + '$',
+              this.prefixPath + versionPath + addLeadingSlash(path),
+            ])
+            .flat()
+        : this.prefixPath
+          ? [this.prefixPath + '$', this.prefixPath + addLeadingSlash(path)]
+          : [addLeadingSlash(path)];
+
+    return Array.isArray(this.excludedGlobalPrefixRoutes)
+      ? [
+          ...entries,
+          ...this.excludedGlobalPrefixRoutes
+            .map(route =>
+              Array.isArray(versionPaths) && versionPaths.length > 0
+                ? versionPaths.map(v => v + addLeadingSlash(route.path))
+                : addLeadingSlash(route.path),
+            )
+            .flat(),
+        ]
+      : entries;
+  }
+
+  return this.extractNonWildcardPathsFrom({ path, method, version });
+}
+```
+
+If the module or controller uses URI versioning, the version segment is prepended. If the route is a wildcard (`*`, `(.*)`), both an exact root match and the wildcard path are registered.
+
+## Example: a complete middleware setup
+
+```ts
+@Injectable()
+export class LoggerMiddleware implements NestMiddleware {
+  use(req: Request, res: Response, next: NextFunction) {
+    console.log(`${req.method} ${req.url}`);
+    next();
+  }
+}
+
+@Module({})
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer
+      .apply(LoggerMiddleware)
+      .forRoutes(
+        { path: 'users', method: RequestMethod.GET },
+        { path: 'orders', method: RequestMethod.POST },
+      );
+  }
+}
+```
+
+During `NestFactory.create(AppModule)`:
+
+1. `MiddlewareModule.loadConfiguration` detects `AppModule.configure`.
+2. It builds a `MiddlewareBuilder`, calls `configure`, and receives one `MiddlewareConfiguration`.
+3. `MiddlewareContainer.insertConfig` creates an `InstanceWrapper` for `LoggerMiddleware`.
+4. `MiddlewareResolver` resolves the instance via `Injector.loadMiddleware`.
+5. `MiddlewareModule.registerMiddleware` binds the proxy to `/users` (GET) and `/orders` (POST).
+6. Only then does `NestApplication.registerRouter` register controller routes.
+
+## Position in the request pipeline
+
+Middleware runs before the route handler but after the adapter's own body parsing and other native middleware. Once the request passes the middleware layer, Nest composes guards, interceptors, and pipes through their respective `ContextCreator` classes. The combined order per layer is global first, then controller-level, then route-level:
+
+1. All matching middleware in module distance order
+2. Guards (global, then controller, then route)
+3. Interceptors (global, then controller, then route) wrapping the handler
+4. Pipes (global, then controller, then route, then parameter-level) transforming parameters
+5. Controller method invocation
+6. Interceptor post-handlers unwind in reverse order (route, then controller, then global)
+7. Response serialization
+8. Exception filters catch any error thrown in steps 2-7 (via the outer `RouterProxy` try/catch)
+
+For details on guards, pipes, interceptors, and exception filters, see [Guards](/http/guards), [Pipes](/http/pipes), [Interceptors](/http/interceptors), and [Exception Filters](/http/exception-filters).

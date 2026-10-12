@@ -1,0 +1,458 @@
+---
+title: "Metadata, Decorators, and Reflection in Nest"
+sidebarTitle: "Metadata & Reflection"
+description: "Learn how Nest uses reflect-metadata, decorator factories, and the Reflector service to attach and read metadata that drives routing, dependency injection, and enhancers."
+---
+
+Almost every Nest feature you use daily, from `@Controller` to `@Get`, from `@Injectable` to `@UseGuards`, is built on a small layer of metadata attached to classes, methods, and properties via `reflect-metadata`. This page explains the internal constants, decorator implementations, and reflection utilities that translate your decorators into runtime behavior.
+
+## Metadata constants
+
+All metadata keys are defined as plain strings in `packages/common/constants.ts`. They are used consistently by decorators in `packages/common/decorators` and read later by the scanner, router, and injector.
+
+```ts packages/common/constants.ts
+export const MODULE_METADATA = {
+  IMPORTS: 'imports',
+  PROVIDERS: 'providers',
+  CONTROLLERS: 'controllers',
+  EXPORTS: 'exports',
+};
+
+export const GLOBAL_MODULE_METADATA = '__module:global__';
+export const HOST_METADATA = 'host';
+export const PATH_METADATA = 'path';
+export const PARAMTYPES_METADATA = 'design:paramtypes';
+export const SELF_DECLARED_DEPS_METADATA = 'self:paramtypes';
+export const OPTIONAL_DEPS_METADATA = 'optional:paramtypes';
+export const PROPERTY_DEPS_METADATA = 'self:properties_metadata';
+export const OPTIONAL_PROPERTY_DEPS_METADATA = 'optional:properties_metadata';
+export const SCOPE_OPTIONS_METADATA = 'scope:options';
+export const METHOD_METADATA = 'method';
+export const ROUTE_ARGS_METADATA = '__routeArguments__';
+export const CUSTOM_ROUTE_ARGS_METADATA = '__customRouteArgs__';
+export const FILTER_CATCH_EXCEPTIONS = '__filterCatchExceptions__';
+
+export const PIPES_METADATA = '__pipes__';
+export const GUARDS_METADATA = '__guards__';
+export const INTERCEPTORS_METADATA = '__interceptors__';
+export const EXCEPTION_FILTERS_METADATA = '__exceptionFilters__';
+
+export const INJECTABLE_WATERMARK = '__injectable__';
+export const CONTROLLER_WATERMARK = '__controller__';
+export const CATCH_WATERMARK = '__catch__';
+export const ENTRY_PROVIDER_WATERMARK = '__entryProvider__';
+```
+
+These constants are the contract between the decorator layer and the framework core. For example, `MODULE_METADATA.IMPORTS` is written by `@Module` and read by `DependenciesScanner` to build the module graph.
+
+## Class decorators
+
+### @Module
+
+`@Module` in `packages/common/decorators/modules/module.decorator.ts` is the simplest class decorator. It takes a `ModuleMetadata` object and writes each property directly onto the class using `Reflect.defineMetadata`:
+
+```ts packages/common/decorators/modules/module.decorator.ts
+export function Module(metadata: ModuleMetadata): ClassDecorator {
+  const propsKeys = Object.keys(metadata);
+  validateModuleKeys(propsKeys);
+
+  return (target: Function) => {
+    for (const property in metadata) {
+      if (Object.hasOwn(metadata, property)) {
+        Reflect.defineMetadata(property, (metadata as any)[property], target);
+      }
+    }
+  };
+}
+```
+
+Because the keys match `MODULE_METADATA`, the scanner can later read `Reflect.getMetadata('imports', CatModule)` and receive the exact array you passed to the decorator.
+
+### @Global
+
+`@Global` writes a single boolean flag:
+
+```ts packages/common/decorators/modules/global.decorator.ts
+export function Global(): ClassDecorator {
+  return (target: Function) => {
+    Reflect.defineMetadata(GLOBAL_MODULE_METADATA, true, target);
+  };
+}
+```
+
+### @Injectable
+
+`@Injectable` stores two pieces of information: the injectable watermark and the scope options:
+
+```ts packages/common/decorators/core/injectable.decorator.ts
+export function Injectable(options?: InjectableOptions): ClassDecorator {
+  return (target: object) => {
+    Reflect.defineMetadata(INJECTABLE_WATERMARK, true, target);
+    Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, options, target);
+  };
+}
+```
+
+The watermark is checked by the scanner to decide whether a class should be treated as a provider. The scope options are read by `getClassScope` and `isDurable`.
+
+### @Controller
+
+`@Controller` writes the controller watermark, path, host, scope options, and version options:
+
+```ts packages/common/decorators/core/controller.decorator.ts
+export function Controller(
+  prefixOrOptions?: string | string[] | ControllerOptions,
+): ClassDecorator {
+  // ... normalize path, host, scope, version
+
+  return (target: object) => {
+    Reflect.defineMetadata(CONTROLLER_WATERMARK, true, target);
+    Reflect.defineMetadata(PATH_METADATA, path, target);
+    Reflect.defineMetadata(HOST_METADATA, host, target);
+    Reflect.defineMetadata(SCOPE_OPTIONS_METADATA, scopeOptions, target);
+    Reflect.defineMetadata(VERSION_METADATA, versionOptions, target);
+  };
+}
+```
+
+The router later reads `PATH_METADATA` and `VERSION_METADATA` to build route tables.
+
+## Constructor and property injection decorators
+
+### @Inject
+
+`@Inject` is both a parameter decorator and a property decorator. When used on a constructor parameter, it appends to `SELF_DECLARED_DEPS_METADATA`:
+
+```ts packages/common/decorators/core/inject.decorator.ts
+export function Inject(
+  token?: InjectionToken | ForwardReference,
+): PropertyDecorator & ParameterDecorator {
+  const injectCallHasArguments = arguments.length > 0;
+
+  return (target: object, key: string | symbol | undefined, index?: number) => {
+    let type = token || Reflect.getMetadata('design:type', target, key!);
+    if (!type && !injectCallHasArguments) {
+      type = Reflect.getMetadata(PARAMTYPES_METADATA, target, key!)?.[index!];
+    }
+
+    if (!isUndefined(index)) {
+      let dependencies =
+        Reflect.getMetadata(SELF_DECLARED_DEPS_METADATA, target) || [];
+
+      dependencies = [...dependencies, { index, param: type }];
+      Reflect.defineMetadata(SELF_DECLARED_DEPS_METADATA, dependencies, target);
+      return;
+    }
+    let properties =
+      Reflect.getMetadata(PROPERTY_DEPS_METADATA, target.constructor) || [];
+
+    properties = [...properties, { key, type }];
+    Reflect.defineMetadata(
+      PROPERTY_DEPS_METADATA,
+      properties,
+      target.constructor,
+    );
+  };
+}
+```
+
+If no token is passed, `@Inject` falls back to `design:paramtypes` (the TypeScript emitted design-time types) or `design:type` for properties. This is why `reflect-metadata` must be imported before any decorator is evaluated.
+
+### @Optional
+
+`@Optional` marks a dependency as optional by storing the parameter index in `OPTIONAL_DEPS_METADATA` or the property key in `OPTIONAL_PROPERTY_DEPS_METADATA`:
+
+```ts packages/common/decorators/core/optional.decorator.ts
+export function Optional(): PropertyDecorator & ParameterDecorator {
+  return (target: object, key: string | symbol | undefined, index?: number) => {
+    if (!isUndefined(index)) {
+      const args = Reflect.getOwnMetadata(OPTIONAL_DEPS_METADATA, target) || [];
+      Reflect.defineMetadata(OPTIONAL_DEPS_METADATA, [...args, index], target);
+      return;
+    }
+    const properties =
+      Reflect.getOwnMetadata(
+        OPTIONAL_PROPERTY_DEPS_METADATA,
+        target.constructor,
+      ) || [];
+    Reflect.defineMetadata(
+      OPTIONAL_PROPERTY_DEPS_METADATA,
+      [...properties, key],
+      target.constructor,
+    );
+  };
+}
+```
+
+The injector reads these keys to decide whether to throw `UnknownDependenciesException` or inject `undefined`.
+
+## HTTP mapping decorators
+
+### @RequestMapping and shortcuts
+
+The `@RequestMapping` decorator in `packages/common/decorators/http/request-mapping.decorator.ts` writes `PATH_METADATA` and `METHOD_METADATA` onto the handler method:
+
+```ts packages/common/decorators/http/request-mapping.decorator.ts
+export const RequestMapping = (
+  metadata: RequestMappingMetadata = defaultMetadata,
+): MethodDecorator => {
+  const pathMetadata = metadata[PATH_METADATA];
+  const path = pathMetadata && pathMetadata.length ? pathMetadata : '/';
+  const requestMethod = metadata[METHOD_METADATA] || RequestMethod.GET;
+
+  return (
+    target: object,
+    key: string | symbol,
+    descriptor: TypedPropertyDescriptor<any>,
+  ) => {
+    Reflect.defineMetadata(PATH_METADATA, path, descriptor.value);
+    Reflect.defineMetadata(METHOD_METADATA, requestMethod, descriptor.value);
+    return descriptor;
+  };
+};
+```
+
+Convenience decorators like `@Get`, `@Post`, `@Put` are generated by a factory:
+
+```ts packages/common/decorators/http/request-mapping.decorator.ts
+const createMappingDecorator =
+  (method: RequestMethod) =>
+  (path?: string | string[]): MethodDecorator => {
+    return RequestMapping({
+      [PATH_METADATA]: path,
+      [METHOD_METADATA]: method,
+    });
+  };
+
+export const Post = createMappingDecorator(RequestMethod.POST);
+export const Get = createMappingDecorator(RequestMethod.GET);
+```
+
+### Route parameter decorators
+
+Parameter decorators such as `@Param`, `@Query`, `@Body`, and `@Headers` store their configuration under `ROUTE_ARGS_METADATA` on the class constructor, keyed by the method name:
+
+```ts packages/common/decorators/http/route-params.decorator.ts
+export function assignMetadata<TParamtype = any, TArgs = any>(
+  args: TArgs,
+  paramtype: TParamtype,
+  index: number,
+  options?: ({ data?: ParamData } & ParameterDecoratorOptions) | ParamData,
+  ...legacyPipes: (Type<PipeTransform> | PipeTransform)[]
+) {
+  // ... normalize options
+  return {
+    ...args,
+    [`${paramtype as string}:${index}`]: {
+      index,
+      data: normalizedOptions.data,
+      pipes: normalizedOptions.pipes ?? [],
+      ...(normalizedOptions.schema !== undefined && {
+        schema: normalizedOptions.schema,
+      }),
+    },
+  };
+}
+```
+
+Each decorator calls `Reflect.defineMetadata(ROUTE_ARGS_METADATA, assignMetadata(...), target.constructor, key)`, so `RouterExecutionContext` can later read the full argument specification for a given handler.
+
+## Enhancer decorators
+
+Decorators like `@UseGuards`, `@UsePipes`, `@UseInterceptors`, and `@Catch` store arrays of classes or instances under their respective metadata keys (`GUARDS_METADATA`, `PIPES_METADATA`, `INTERCEPTORS_METADATA`, `EXCEPTION_FILTERS_METADATA`). The scanner collects these arrays and registers each item as an enhancer in the host module's `injectables` collection.
+
+For example, `@UseGuards` is implemented in `packages/common/decorators/core/use-guards.decorator.ts` and simply pushes guard classes into `GUARDS_METADATA` on the class or method descriptor.
+
+## SetMetadata and applyDecorators
+
+### SetMetadata
+
+`SetMetadata` is the lowest-level decorator factory. It writes an arbitrary key-value pair:
+
+```ts packages/common/decorators/core/set-metadata.decorator.ts
+export const SetMetadata = <K = string, V = any>(
+  metadataKey: K,
+  metadataValue: V,
+): CustomDecorator<K> => {
+  const decoratorFactory = (target: object, key?: any, descriptor?: any) => {
+    if (descriptor) {
+      Reflect.defineMetadata(metadataKey, metadataValue, descriptor.value);
+      return descriptor;
+    }
+    Reflect.defineMetadata(metadataKey, metadataValue, target);
+    return target;
+  };
+  decoratorFactory.KEY = metadataKey;
+  return decoratorFactory;
+};
+```
+
+The returned function carries a `.KEY` property so that `Reflector` can reference the decorator itself instead of a string key.
+
+### applyDecorators
+
+`applyDecorators` composes multiple decorators into one:
+
+```ts packages/common/decorators/core/apply-decorators.ts
+export function applyDecorators(
+  ...decorators: Array<ClassDecorator | MethodDecorator | PropertyDecorator>
+) {
+  return <TFunction extends Function, Y>(
+    target: TFunction | object,
+    propertyKey?: string | symbol,
+    descriptor?: TypedPropertyDescriptor<Y>,
+  ) => {
+    for (const decorator of decorators) {
+      if (target instanceof Function && !descriptor) {
+        (decorator as ClassDecorator)(target);
+        continue;
+      }
+      (decorator as MethodDecorator | PropertyDecorator)(
+        target,
+        propertyKey!,
+        descriptor!,
+      );
+    }
+  };
+}
+```
+
+This is frequently used in custom decorators that need to attach metadata, apply a guard, and set a route path at the same time.
+
+## Reflector service
+
+`Reflector` in `packages/core/services/reflector.service.ts` is the public API for reading back everything that decorators wrote. It provides four retrieval patterns:
+
+| Method | Behavior |
+| --- | --- |
+| `get(key, target)` | Read a single metadata value from a class or method. |
+| `getAll(key, targets)` | Read values from multiple targets and return an array. |
+| `getAllAndMerge(key, targets)` | Merge arrays or shallow-merge objects across targets. |
+| `getAllAndOverride(key, targets)` | Return the first non-undefined value from the target list. |
+
+`getAllAndOverride` is the algorithm used by guards and interceptors to decide whether a method-level decorator should win over a class-level one:
+
+```ts packages/core/services/reflector.service.ts
+public getAllAndOverride<TResult = any, TKey = any>(
+  metadataKeyOrDecorator: TKey,
+  targets: (Type<any> | Function)[],
+): TResult | undefined {
+  for (const target of targets) {
+    const result = this.get(metadataKeyOrDecorator, target);
+    if (result !== undefined) {
+      return result;
+    }
+  }
+  return undefined;
+}
+```
+
+### createDecorator
+
+`Reflector.createDecorator` lets you build type-safe decorators with less boilerplate than `SetMetadata`:
+
+```ts packages/core/services/reflector.service.ts
+static createDecorator<TParam, TTransformed = TParam>(
+  options: CreateDecoratorOptions<TParam, TTransformed> = {},
+): ReflectableDecorator<TParam, TTransformed> {
+  const metadataKey = options.key ?? uid(21);
+  const decoratorFn =
+    (metadataValue: TParam) =>
+    (target: object | Function, key?: string | symbol, descriptor?: any) => {
+      const value = options.transform
+        ? options.transform(metadataValue)
+        : metadataValue;
+      SetMetadata(metadataKey, value ?? {})(target, key!, descriptor);
+    };
+
+  decoratorFn.KEY = metadataKey;
+  return decoratorFn as ReflectableDecorator<TParam, TTransformed>;
+}
+```
+
+The generated decorator delegates to `SetMetadata` but carries a strongly-typed signature and an automatically generated key.
+
+## MetadataScanner
+
+`MetadataScanner` in `packages/core/metadata-scanner.ts` walks the prototype chain of a class and returns every method name that is a plain function (not a getter, setter, or constructor):
+
+```ts packages/core/metadata-scanner.ts
+export class MetadataScanner {
+  private readonly cachedScannedPrototypes: Map<object, string[]> = new Map();
+
+  public getAllMethodNames(prototype: object | null): string[] {
+    if (!prototype) {
+      return [];
+    }
+    if (this.cachedScannedPrototypes.has(prototype)) {
+      return this.cachedScannedPrototypes.get(prototype)!;
+    }
+    // ... walk prototype chain, collect method names
+    this.cachedScannedPrototypes.set(prototype, result);
+    return result;
+  }
+}
+```
+
+The scanner is used by `RouterExplorer` to enumerate all route handlers on a controller, and by lifecycle hook callers to find `onModuleInit`, `onApplicationBootstrap`, and similar methods.
+
+## design:paramtypes
+
+TypeScript emits design-time type metadata when `emitDecoratorMetadata` is enabled. Nest relies on `design:paramtypes` to infer constructor dependencies when you do not use `@Inject`. The `reflect-metadata` polyfill is required because this key is part of the JavaScript metadata proposal.
+
+For example, when you write:
+
+```ts
+@Injectable()
+class CatsService {
+  constructor(private catsRepository: CatsRepository) {}
+}
+```
+
+TypeScript stores `[CatsRepository]` under `Reflect.getMetadata('design:paramtypes', CatsService)`. The injector reads this array during `DependenciesScanner` and creates the corresponding `InstanceWrapper` entries.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/common/constants.ts` | All metadata keys used by decorators and the framework core. |
+| `packages/common/decorators/core/injectable.decorator.ts` | `@Injectable` and scope metadata. |
+| `packages/common/decorators/core/controller.decorator.ts` | `@Controller`, path, host, version metadata. |
+| `packages/common/decorators/core/inject.decorator.ts` | `@Inject` for constructor and property injection. |
+| `packages/common/decorators/core/optional.decorator.ts` | `@Optional` dependency marking. |
+| `packages/common/decorators/core/set-metadata.decorator.ts` | `SetMetadata` low-level decorator factory. |
+| `packages/common/decorators/core/apply-decorators.ts` | `applyDecorators` composition helper. |
+| `packages/common/decorators/modules/module.decorator.ts` | `@Module` class decorator. |
+| `packages/common/decorators/modules/global.decorator.ts` | `@Global` class decorator. |
+| `packages/common/decorators/http/request-mapping.decorator.ts` | `@RequestMapping`, `@Get`, `@Post`, etc. |
+| `packages/common/decorators/http/route-params.decorator.ts` | `@Param`, `@Query`, `@Body`, `@Headers`, etc. |
+| `packages/core/services/reflector.service.ts` | `Reflector` and `createDecorator`. |
+| `packages/core/metadata-scanner.ts` | `MetadataScanner` prototype walker. |
+
+## Example: custom decorator with metadata
+
+```ts
+const Roles = Reflector.createDecorator<string[]>();
+
+@Controller('cats')
+@Roles(['admin'])
+class CatsController {
+  @Get()
+  @Roles(['user', 'admin'])
+  findAll() {}
+}
+
+// In a guard:
+const roles = this.reflector.getAllAndOverride(Roles, [
+  context.getHandler(),
+  context.getClass(),
+]);
+```
+
+In this example:
+
+1. `Reflector.createDecorator` generates a metadata key automatically.
+2. `@Roles` attaches an array to the class and the method.
+3. The guard uses `getAllAndOverride` so that method-level roles win over class-level roles.
+
+For how decorators drive the request pipeline, see [Guards](/http/guards) and [Interceptors](/http/interceptors). For how the scanner consumes module metadata, see [Modules and Container](/di/modules-and-container).

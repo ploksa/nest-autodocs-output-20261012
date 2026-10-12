@@ -1,0 +1,370 @@
+---
+title: "ModuleRef, NestApplicationContext, and Lazy Loading"
+sidebarTitle: "ModuleRef & Lazy Loading"
+description: "How ModuleRef retrieves instances at runtime through InstanceLinksHost and AbstractInstanceResolver, and how LazyModuleLoader loads modules on demand."
+---
+
+Sometimes you need to resolve a provider after the application has already booted, or you want to load an entire module only when a specific operation runs. Nest provides two complementary mechanisms for this: `ModuleRef` (and its parent `NestApplicationContext`) for runtime instance lookup, and `LazyModuleLoader` for on-demand module loading. This page explains the internal types and control flow that make both possible.
+
+## AbstractInstanceResolver
+
+`AbstractInstanceResolver` in `packages/core/injector/abstract-instance-resolver.ts` is the base class that unifies instance retrieval across `NestApplicationContext` and `ModuleRef`. It declares three protected abstract members:
+
+```ts packages/core/injector/abstract-instance-resolver.ts
+export abstract class AbstractInstanceResolver {
+  protected abstract instanceLinksHost: InstanceLinksHost;
+  protected abstract injector: Injector;
+
+  protected abstract get<TInput = any, TResult = TInput>(
+    typeOrToken: Type<TInput> | Function | string | symbol,
+    options?: GetOrResolveOptions,
+  ): TResult | Array<TResult>;
+```
+
+Concrete subclasses implement `get` and `resolve`, but the heavy lifting is handled by two protected methods: `find` and `resolvePerContext`.
+
+### find
+
+`find` is used for the synchronous `get()` API. It looks up the token via `InstanceLinksHost`, then checks the wrapper's scope. If the wrapper is request-scoped or transient (or its dependency tree is non-static), `find` throws `InvalidClassScopeException`. Otherwise it returns the static instance directly:
+
+```ts packages/core/injector/abstract-instance-resolver.ts
+protected find<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | Abstract<TInput> | string | symbol,
+  options: { moduleId?: string; each?: boolean },
+): TResult | Array<TResult> {
+  const instanceLinkOrArray = this.instanceLinksHost.get<TResult>(
+    typeOrToken,
+    options,
+  );
+  const pluckInstance = ({ wrapperRef }: InstanceLink) => {
+    if (
+      wrapperRef.scope === Scope.REQUEST ||
+      wrapperRef.scope === Scope.TRANSIENT ||
+      !wrapperRef.isDependencyTreeStatic()
+    ) {
+      throw new InvalidClassScopeException(typeOrToken);
+    }
+    return wrapperRef.instance;
+  };
+  // ...
+}
+```
+
+### resolvePerContext
+
+`resolvePerContext` is the async path for `resolve()`. It first checks whether the wrapper is static and non-transient, in which case it returns the cached instance immediately. Otherwise it calls `Injector.loadPerContext` with the current `ContextId`, forcing the injector to instantiate a fresh request-scoped or transient instance:
+
+```ts packages/core/injector/abstract-instance-resolver.ts
+protected async resolvePerContext<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | Abstract<TInput> | string | symbol,
+  contextModule: Module,
+  contextId: ContextId,
+  options?: GetOrResolveOptions,
+): Promise<TResult | Array<TResult>> {
+  const instanceLinkOrArray = options?.strict
+    ? this.instanceLinksHost.get(typeOrToken, {
+        moduleId: contextModule.id,
+        each: options.each,
+      })
+    : this.instanceLinksHost.get(typeOrToken, {
+        each: options?.each,
+      });
+
+  const pluckInstance = async (instanceLink: InstanceLink) => {
+    const { wrapperRef, collection } = instanceLink;
+    if (wrapperRef.isDependencyTreeStatic() && !wrapperRef.isTransient) {
+      return wrapperRef.instance;
+    }
+    const ctorHost = wrapperRef.instance || { constructor: typeOrToken };
+    const instance = await this.injector.loadPerContext(
+      ctorHost,
+      wrapperRef.host!,
+      collection,
+      contextId,
+      wrapperRef,
+    );
+    if (!instance) {
+      throw new UnknownElementException();
+    }
+    return instance;
+  };
+  // ...
+}
+```
+
+## InstanceLinksHost
+
+Before any token can be resolved, Nest must know which modules contain it. `InstanceLinksHost` in `packages/core/injector/instance-links-host.ts` builds a flat index from every provider, injectable, and controller token to the `Module` that owns it.
+
+```ts packages/core/injector/instance-links-host.ts
+export interface InstanceLink<T = any> {
+  token: InjectionToken;
+  wrapperRef: InstanceWrapper<T>;
+  collection: Map<any, InstanceWrapper>;
+  moduleId: string;
+}
+```
+
+In its constructor, `InstanceLinksHost` iterates over the full `ModulesContainer` and records one `InstanceLink` per token per module:
+
+```ts packages/core/injector/instance-links-host.ts
+private initialize() {
+  const modules = this.container.getModules();
+  modules.forEach(moduleRef => {
+    const { providers, injectables, controllers } = moduleRef;
+    providers.forEach((wrapper, token) =>
+      this.addLink(wrapper, token, moduleRef, 'providers'),
+    );
+    injectables.forEach((wrapper, token) =>
+      this.addLink(wrapper, token, moduleRef, 'injectables'),
+    );
+    controllers.forEach((wrapper, token) =>
+      this.addLink(wrapper, token, moduleRef, 'controllers'),
+    );
+  });
+}
+```
+
+When `get(token, { moduleId, each })` is called, it returns either the last registered link (module-scoped override wins) or an array of all links when `each: true`. The `strict` option in `get`/`resolve` simply restricts `moduleId` to the current context module.
+
+## ModuleRef
+
+`ModuleRef` in `packages/core/injector/module-ref.ts` is an abstract class that every module's internal provider receives. It exposes:
+
+- `get(typeOrToken, options?)`: synchronous lookup. Only works for static (singleton) providers.
+- `resolve(typeOrToken, contextId?, options?)`: async lookup that can instantiate request-scoped or transient providers.
+- `create(type, contextId?)`: instantiate an arbitrary class with full DI support.
+- `introspect(token)`: returns the resolved `Scope` after dependency-tree analysis.
+- `registerRequestByContextId(request, contextId)`: binds a request object to a context id.
+
+Each module gets its own concrete subclass of `ModuleRef`. The subclass is generated dynamically inside `Module.createModuleReferenceType()` and hard-codes the host module (`self`) into its `get`, `resolve`, and `create` implementations.
+
+### get and resolve in the concrete subclass
+
+```ts packages/core/injector/module.ts (inside createModuleReferenceType)
+public get<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | string | symbol,
+  options: ModuleRefGetOrResolveOpts = {},
+): TResult | Array<TResult> {
+  options.strict ??= true;
+  options.each ??= false;
+
+  return this.find<TInput, TResult>(
+    typeOrToken,
+    options.strict
+      ? {
+          moduleId: self.id,
+          each: options.each,
+        }
+      : options,
+  );
+}
+
+public resolve<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | string | symbol,
+  contextId = createContextId(),
+  options: ModuleRefGetOrResolveOpts = {},
+): Promise<TResult | Array<TResult>> {
+  options.strict ??= true;
+  options.each ??= false;
+
+  return this.resolvePerContext<TInput, TResult>(
+    typeOrToken,
+    self,
+    contextId,
+    options,
+  );
+}
+```
+
+Notice that `options.strict` defaults to `true` on `ModuleRef`, so lookups are restricted to the module unless you explicitly pass `strict: false`. This is the opposite default from `NestApplicationContext.get()`.
+
+### create
+
+`ModuleRef.create(type, contextId?)` lets you instantiate any class with Nest's injector resolving its constructor parameters and property injections:
+
+```ts packages/core/injector/module-ref.ts
+public async create<T = any>(
+  type: Type<T>,
+  contextId?: ContextId,
+): Promise<T> {
+  if (!(type && isFunction(type) && type.prototype)) {
+    throw new InvalidClassException(type);
+  }
+  return this.instantiateClass<T>(type, self, contextId);
+}
+```
+
+`instantiateClass` builds a temporary `InstanceWrapper`, creates a prototype, then runs `Injector.resolveConstructorParams` and `Injector.resolveProperties`.
+
+### introspect
+
+`introspect` returns the effective scope after tree analysis:
+
+```ts packages/core/injector/module-ref.ts
+public introspect<T = any>(
+  token: Type<T> | string | symbol,
+): IntrospectionResult {
+  const { wrapperRef } = this.instanceLinksHost.get(token);
+
+  let scope = Scope.DEFAULT;
+  if (!wrapperRef.isDependencyTreeStatic()) {
+    scope = Scope.REQUEST;
+  } else if (wrapperRef.isTransient) {
+    scope = Scope.TRANSIENT;
+  }
+  return { scope };
+}
+```
+
+This is useful when you need to know at runtime whether retrieving a provider via `get` will succeed or require `resolve`.
+
+## NestApplicationContext
+
+`NestApplicationContext` in `packages/core/nest-application-context.ts` inherits from `AbstractInstanceResolver` and is the base of both `NestApplication` (HTTP) and standalone contexts. It adds:
+
+- `select(moduleType)`: navigate to another module and receive a new context whose `strict` lookups are scoped to that module.
+- `get(typeOrToken, options?)`: defaults to `strict: false`, searching the entire application.
+- `resolve(typeOrToken, contextId?, options?)`: same as `ModuleRef.resolve` but uses the currently selected module as the context module.
+- Lifecycle hooks: `init`, `close`, and shutdown signal handling.
+
+The `select` method compiles the module token via `ModuleCompiler` and returns a fresh `NestApplicationContext` pointing at that module:
+
+```ts packages/core/nest-application-context.ts
+public select<T>(
+  moduleType: Type<T> | DynamicModule,
+  selectOptions?: SelectOptions,
+): INestApplicationContext {
+  const modulesContainer = this.container.getModules();
+  // ... compile token, look up module, return new context
+  return new NestApplicationContext(
+    this.container,
+    options,
+    selectedModule,
+    scope,
+  );
+}
+```
+
+Because `NestApplicationContext` owns the container, it can search globally, whereas `ModuleRef` defaults to the local module.
+
+## LazyModuleLoader
+
+`LazyModuleLoader` in `packages/core/injector/lazy-module-loader/lazy-module-loader.ts` allows you to load a module after bootstrap. It is constructed with the same `DependenciesScanner`, `InstanceLoader`, `ModuleCompiler`, and `ModulesContainer` used during startup, so the runtime behavior is identical:
+
+```ts packages/core/injector/lazy-module-loader/lazy-module-loader.ts
+export class LazyModuleLoader {
+  constructor(
+    private readonly dependenciesScanner: DependenciesScanner,
+    private readonly instanceLoader: InstanceLoader,
+    private readonly moduleCompiler: ModuleCompiler,
+    private readonly modulesContainer: ModulesContainer,
+    private readonly moduleOverrides?: ModuleOverride[],
+  ) {}
+```
+
+The `load` method accepts a loader function that returns a class or `DynamicModule`:
+
+<Steps>
+  <Step title="Call loader function">
+    The user-supplied `loaderFn()` is awaited to obtain the module definition.
+  </Step>
+  <Step title="Scan for modules">
+    `dependenciesScanner.scanForModules({ moduleDefinition, overrides, lazy: true })` discovers the module and its imports.
+  </Step>
+  <Step title="Handle already loaded modules">
+    If the module already exists in `ModulesContainer`, the method returns the existing module's `ModuleRef` immediately.
+  </Step>
+  <Step title="Scan dependencies and instantiate">
+    `scanModulesForDependencies(lazyModulesContainer)` wires providers, controllers, and exports. Then `instanceLoader.createInstancesOfDependencies(lazyModulesContainer)` creates all instances.
+  </Step>
+  <Step title="Return ModuleRef">
+    The target module's `ModuleRef` instance is extracted from its provider map and returned.
+  </Step>
+</Steps>
+
+```ts packages/core/injector/lazy-module-loader/lazy-module-loader.ts
+public async load(
+  loaderFn: () =>
+    Promise<Type<unknown> | DynamicModule> | Type<unknown> | DynamicModule,
+  loadOpts?: LazyModuleLoaderLoadOptions,
+): Promise<ModuleRef> {
+  // ...
+  const moduleClassOrDynamicDefinition = await loaderFn();
+  const moduleInstances = await this.dependenciesScanner.scanForModules({
+    moduleDefinition: moduleClassOrDynamicDefinition,
+    overrides: this.moduleOverrides,
+    lazy: true,
+  });
+  if (moduleInstances.length === 0) {
+    const { token } = await this.moduleCompiler.compile(
+      moduleClassOrDynamicDefinition,
+    );
+    const moduleInstance = this.modulesContainer.get(token)!;
+    return moduleInstance && this.getTargetModuleRef(moduleInstance);
+  }
+  const lazyModulesContainer =
+    this.createLazyModulesContainer(moduleInstances);
+  await this.dependenciesScanner.scanModulesForDependencies(
+    lazyModulesContainer,
+  );
+  await this.instanceLoader.createInstancesOfDependencies(
+    lazyModulesContainer,
+  );
+  const [targetModule] = moduleInstances;
+  return this.getTargetModuleRef(targetModule);
+}
+```
+
+The `logger: false` option suppresses logs by temporarily swapping `InstanceLoader.logger` with `SilentLogger`.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/injector/abstract-instance-resolver.ts` | Base class with `find` and `resolvePerContext`. |
+| `packages/core/injector/instance-links-host.ts` | Global token-to-module index used by `get`/`resolve`. |
+| `packages/core/injector/module-ref.ts` | Abstract `ModuleRef`, `introspect`, `instantiateClass`. |
+| `packages/core/injector/module.ts` | `createModuleReferenceType` generating the concrete `ModuleRef`. |
+| `packages/core/nest-application-context.ts` | `select`, `get`, `resolve`, lifecycle hooks. |
+| `packages/core/injector/lazy-module-loader/lazy-module-loader.ts` | `LazyModuleLoader.load` implementation. |
+| `packages/core/injector/lazy-module-loader/lazy-module-loader-options.interface.ts` | `LazyModuleLoaderLoadOptions`. |
+
+## Example: runtime resolution and lazy loading
+
+```ts
+@Module({ providers: [FeatureService] })
+class FeatureModule {}
+
+@Injectable()
+class AppService {
+  constructor(private moduleRef: ModuleRef) {}
+
+  async onDemand(token: string) {
+    // Resolve a request-scoped provider at runtime
+    const contextId = ContextIdFactory.create();
+    const provider = await this.moduleRef.resolve(
+      SomeRequestScopedProvider,
+      contextId,
+      { strict: false },
+    );
+    return provider.process(token);
+  }
+}
+
+async function bootstrap() {
+  const app = await NestFactory.createApplicationContext(AppModule);
+
+  const lazyLoader = app.get(LazyModuleLoader);
+  const featureRef = await lazyLoader.load(() => FeatureModule);
+
+  const featureService = featureRef.get(FeatureService);
+}
+```
+
+In this example:
+
+1. `ModuleRef.resolve` creates a new context id and instantiates `SomeRequestScopedProvider` on the fly.
+2. `LazyModuleLoader.load` imports `FeatureModule` after the app has already started, scans it, instantiates its providers, and returns a `ModuleRef` that can be used just like any other.
+
+For how the scanner discovers modules in the first place, see [Dependency Scanner](/di/dependency-scanner). For the resolution algorithm itself, see [Injector](/di/injector).

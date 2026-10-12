@@ -1,0 +1,369 @@
+---
+title: "Nest Extension Points and Customization Interfaces"
+sidebarTitle: "Extension Points"
+description: "A catalog of public Nest extension points: custom providers, dynamic modules, enhancers, decorators, HTTP and WebSocket adapters, transports, and loggers."
+---
+
+Nest is built around a small, stable set of interfaces and factory functions that let you replace or extend nearly every layer of the framework. This page catalogs every public extension point with the exact source interface and a minimal verified example. Use it as a map when you need to implement a custom transport, a custom HTTP adapter, a global enhancer, or a provider variation.
+
+### Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/common/interfaces/modules/provider.interface.ts` | `ClassProvider`, `ValueProvider`, `FactoryProvider`, `ExistingProvider` |
+| `packages/common/module-utils/configurable-module.builder.ts` | `ConfigurableModuleBuilder` factory for dynamic modules |
+| `packages/core/constants.ts` | `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER` tokens |
+| `packages/common/decorators/http/create-route-param-metadata.decorator.ts` | `createParamDecorator` factory |
+| `packages/core/services/reflector.service.ts` | `Reflector.createDecorator` and metadata retrieval APIs |
+| `packages/common/decorators/core/apply-decorators.ts` | `applyDecorators` utility |
+| `packages/core/adapters/http-adapter.ts` | `AbstractHttpAdapter` base class |
+| `packages/common/interfaces/websockets/web-socket-adapter.interface.ts` | `WebSocketAdapter` interface |
+| `packages/microservices/interfaces/custom-transport-strategy.interface.ts` | `CustomTransportStrategy` interface |
+| `packages/microservices/client/client-proxy.ts` | `ClientProxy` abstract class |
+| `packages/common/interfaces/hooks/*.interface.ts` | Lifecycle hook interfaces |
+| `packages/common/services/logger.service.ts` | `LoggerService` interface and `Logger` class |
+| `packages/common/interfaces/exceptions/exception-filter.interface.ts` | `ExceptionFilter<T>` interface |
+
+## Custom providers
+
+The `Provider` union in `@nestjs/common` accepts five shapes. Four of them are explicit custom-provider objects:
+
+```ts
+packages/common/interfaces/modules/provider.interface.ts
+export type Provider<T = any> =
+  | Type<any>
+  | ClassProvider<T>
+  | ValueProvider<T>
+  | FactoryProvider<T>
+  | ExistingProvider<T>;
+```
+
+| Shape | Key interface | When to use |
+| --- | --- | --- |
+| `useClass` | `ClassProvider` | Substitute or scope a class implementation |
+| `useValue` | `ValueProvider` | Inject a plain object, constant, or mock |
+| `useFactory` | `FactoryProvider` | Build the instance dynamically with dependencies |
+| `useExisting` | `ExistingProvider` | Create an alias token that points to another provider |
+
+A factory provider can also declare `scope`:
+
+```ts
+packages/common/interfaces/modules/provider.interface.ts
+export interface FactoryProvider<T = any> {
+  provide: InjectionToken;
+  useFactory: (...args: any[]) => T | Promise<T>;
+  inject?: Array<InjectionToken | OptionalFactoryDependency>;
+  scope?: Scope;
+  durable?: boolean;
+}
+```
+
+Example: custom logger as a value provider.
+
+```ts
+import { LoggerService, ValueProvider } from '@nestjs/common';
+
+const myLoggerProvider: ValueProvider<LoggerService> = {
+  provide: 'MY_LOGGER',
+  useValue: {
+    log: (msg: string) => console.log(`[CUSTOM] ${msg}`),
+    error: (msg: string) => console.error(`[CUSTOM] ${msg}`),
+    warn: (msg: string) => console.warn(`[CUSTOM] ${msg}`),
+  } as LoggerService,
+};
+```
+
+## Dynamic modules and ConfigurableModuleBuilder
+
+Dynamic modules expose static methods that return a `DynamicModule` object. `ConfigurableModuleBuilder` removes most of the boilerplate by generating the method, the options token, and the async variant automatically.
+
+```ts
+packages/common/module-utils/configurable-module.builder.ts
+export class ConfigurableModuleBuilder<ModuleOptions> {
+  setExtras<Extra>(extras: Extra, transform: (def, extra) => DynamicModule);
+  setClassMethodName<Name extends string>(key: Name);
+  setFactoryMethodName<Name extends string>(key: Name);
+  build(): ConfigurableModuleHost<...>;
+}
+```
+
+Example:
+
+```ts
+import { ConfigurableModuleBuilder } from '@nestjs/common';
+
+interface CacheOptions {
+  ttl: number;
+}
+
+const { ConfigurableModuleClass, MODULE_OPTIONS_TOKEN } =
+  new ConfigurableModuleBuilder<CacheOptions>()
+    .setClassMethodName('forRoot')
+    .setExtras<{ isGlobal?: boolean }>(
+      { isGlobal: false },
+      (definition, extras) => ({ ...definition, global: extras.isGlobal }),
+    )
+    .build();
+
+@Module({})
+class CacheModule extends ConfigurableModuleClass {}
+```
+
+Consumers then write `CacheModule.forRoot({ ttl: 5, isGlobal: true })`.
+
+## Global enhancers via APP\_\* tokens
+
+Four string tokens in `packages/core/constants.ts` let you register global enhancers as providers:
+
+```ts
+packages/core/constants.ts
+export const APP_INTERCEPTOR = 'APP_INTERCEPTOR';
+export const APP_PIPE = 'APP_PIPE';
+export const APP_GUARD = 'APP_GUARD';
+export const APP_FILTER = 'APP_FILTER';
+```
+
+The scanner maps each token to an enhancer subtype:
+
+```ts
+export const ENHANCER_TOKEN_TO_SUBTYPE_MAP = {
+  [APP_GUARD]: 'guard',
+  [APP_INTERCEPTOR]: 'interceptor',
+  [APP_PIPE]: 'pipe',
+  [APP_FILTER]: 'filter',
+} as const;
+```
+
+Example: a global guard.
+
+```ts
+{
+  provide: APP_GUARD,
+  useClass: AuthGuard,
+}
+```
+
+## Custom decorators
+
+### Route parameter decorators
+
+`createParamDecorator` builds decorators that extract data from the request:
+
+```ts
+packages/common/decorators/http/create-route-param-metadata.decorator.ts
+export function createParamDecorator<FactoryData = any, FactoryOutput = any>(
+  factory: CustomParamFactory<FactoryData, FactoryOutput>,
+  enhancers: ParamDecoratorEnhancer[] = [],
+): (...dataOrPipes: ...) => ParameterDecorator
+```
+
+Example:
+
+```ts
+import { createParamDecorator, ExecutionContext } from '@nestjs/common';
+
+const CurrentUser = createParamDecorator(
+  (data: string | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    return data ? request.user?.[data] : request.user;
+  },
+);
+```
+
+### Reflector decorators
+
+`Reflector.createDecorator` is the strongly typed alternative to `@SetMetadata`:
+
+```ts
+packages/core/services/reflector.service.ts
+static createDecorator<TParam>(
+  options?: CreateDecoratorOptions<TParam>,
+): ReflectableDecorator<TParam>;
+```
+
+Example:
+
+```ts
+import { Reflector } from '@nestjs/core';
+
+const Roles = Reflector.createDecorator<string[]>();
+```
+
+### Composing decorators
+
+`applyDecorators` merges multiple class, method, or property decorators into one:
+
+```ts
+packages/common/decorators/core/apply-decorators.ts
+export function applyDecorators(
+  ...decorators: Array<ClassDecorator | MethodDecorator | PropertyDecorator>
+)
+```
+
+Example:
+
+```ts
+import { applyDecorators, Get, UseGuards } from '@nestjs/common';
+
+const AdminOnly = () =>
+  applyDecorators(Get('admin'), UseGuards(AdminGuard));
+```
+
+## Custom HTTP adapter
+
+To support a new HTTP library, subclass `AbstractHttpAdapter` and implement the abstract methods. The base class already forwards common HTTP methods (`get`, `post`, etc.) to the underlying `instance`.
+
+```ts
+packages/core/adapters/http-adapter.ts
+export abstract class AbstractHttpAdapter<TServer, TRequest, TResponse>
+  implements HttpServer<TRequest, TResponse> {
+  protected instance: any;
+
+  abstract close();
+  abstract initHttpServer(options: NestApplicationOptions);
+  abstract getRequestMethod(request: any);
+  abstract getRequestUrl(request: any);
+  abstract status(response: any, statusCode: number);
+  abstract reply(response: any, body: any, statusCode?: number);
+  abstract setErrorHandler(handler: Function, prefix?: string);
+  abstract setNotFoundHandler(handler: Function, prefix?: string);
+  abstract applyVersionFilter(...);
+  // ...
+}
+```
+
+`ExpressAdapter` and `FastifyAdapter` are the two built-in implementations in the platform packages.
+
+## Custom WebSocket adapter
+
+The `WebSocketAdapter` interface is simpler than the HTTP adapter because it only needs to create a server, connect/disconnect handlers, and bind message handlers:
+
+```ts
+packages/common/interfaces/websockets/web-socket-adapter.interface.ts
+export interface WebSocketAdapter<TServer = any, TClient = any, TOptions = any> {
+  create(port: number, options?: TOptions): TServer;
+  bindClientConnect(server: TServer, callback: Function): any;
+  bindClientDisconnect?(client: TClient, callback: Function): any;
+  bindMessageHandlers(
+    client: TClient,
+    handlers: WsMessageHandler[],
+    transform: (data: any) => Observable<any>,
+  ): any;
+  close(server: TServer): any;
+}
+```
+
+Example: the built-in `IoAdapter` in `@nestjs/platform-socket.io` implements this interface for Socket.IO.
+
+## Custom transport strategies and client proxies
+
+### Server-side strategy
+
+A microservice transport is any class that implements `CustomTransportStrategy`:
+
+```ts
+packages/microservices/interfaces/custom-transport-strategy.interface.ts
+export interface CustomTransportStrategy {
+  transportId?: TransportId;
+  listen(callback: (...optionalParams: unknown[]) => any): any;
+  close(): any;
+}
+```
+
+The framework calls `listen` with a callback that must be invoked once the transport is ready to accept messages. `close` tears it down.
+
+### Client-side proxy
+
+On the client side, subclass `ClientProxy` and implement `connect`, `close`, `publish`, and `dispatchEvent`:
+
+```ts
+packages/microservices/client/client-proxy.ts
+export abstract class ClientProxy<EventsMap, Status> {
+  public abstract connect(): Promise<any>;
+  public abstract close(): any;
+  protected abstract publish(
+    packet: ReadPacket,
+    callback: (packet: WritePacket) => void,
+  ): () => void;
+  protected abstract dispatchEvent<T = any>(packet: ReadPacket): Promise<T>;
+}
+```
+
+`send` and `emit` are implemented in the base class; they call `connect()`, then `publish` (for request/response) or `dispatchEvent` (for fire-and-forget events).
+
+## Lifecycle hooks
+
+Nest invokes lifecycle hooks in a deterministic order during startup and shutdown. Implement the interfaces on providers, controllers, or modules.
+
+| Hook | Interface | Trigger |
+| --- | --- | --- |
+| Module init | `OnModuleInit` | After all modules in a tree have been initialized |
+| Application bootstrap | `OnApplicationBootstrap` | After `app.listen` or `app.init` |
+| Module destroy | `OnModuleDestroy` | During `app.close()`, before connection teardown |
+| Before shutdown | `BeforeApplicationShutdown` | During `app.close()`, receives optional signal |
+| Application shutdown | `OnApplicationShutdown` | Final shutdown stage |
+
+```ts
+packages/common/interfaces/hooks/on-init.interface.ts
+export interface OnModuleInit {
+  onModuleInit(): any;
+}
+```
+
+## Custom logger
+
+Replace the default logger by providing an object that satisfies `LoggerService`:
+
+```ts
+packages/common/services/logger.service.ts
+export interface LoggerService {
+  log(message: any, ...optionalParams: any[]): any;
+  error(message: any, ...optionalParams: any[]): any;
+  warn(message: any, ...optionalParams: any[]): any;
+  debug?(message: any, ...optionalParams: any[]): any;
+  verbose?(message: any, ...optionalParams: any[]): any;
+  fatal?(message: any, ...optionalParams: any[]): any;
+  setLogLevels?(levels: LogLevel[]): any;
+}
+```
+
+The built-in `ConsoleLogger` implements every method and is the default backend for the `Logger` class. You can override the global logger with `Logger.overrideLogger(myService)` or through `NestFactory.create(AppModule, { logger: myService })`.
+
+## Exception filters
+
+An exception filter implements `ExceptionFilter<T>`:
+
+```ts
+packages/common/interfaces/exceptions/exception-filter.interface.ts
+export interface ExceptionFilter<T = any> {
+  catch(exception: T, host: ArgumentsHost): any;
+}
+```
+
+The `@Catch()` decorator attaches metadata that the framework uses to map exception types to filter instances. Use `APP_FILTER` to register a filter globally without `@UseFilters()`.
+
+## Summary table
+
+| Extension | Interface / Factory | Location |
+| --- | --- | --- |
+| Custom provider | `ClassProvider`, `ValueProvider`, `FactoryProvider`, `ExistingProvider` | `packages/common/interfaces/modules/provider.interface.ts` |
+| Dynamic module | `ConfigurableModuleBuilder` | `packages/common/module-utils/configurable-module.builder.ts` |
+| Global enhancer | `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER` | `packages/core/constants.ts` |
+| Route param decorator | `createParamDecorator` | `packages/common/decorators/http/create-route-param-metadata.decorator.ts` |
+| Metadata decorator | `Reflector.createDecorator` | `packages/core/services/reflector.service.ts` |
+| Decorator composition | `applyDecorators` | `packages/common/decorators/core/apply-decorators.ts` |
+| HTTP adapter | `AbstractHttpAdapter` | `packages/core/adapters/http-adapter.ts` |
+| WebSocket adapter | `WebSocketAdapter` | `packages/common/interfaces/websockets/web-socket-adapter.interface.ts` |
+| Server transport | `CustomTransportStrategy` | `packages/microservices/interfaces/custom-transport-strategy.interface.ts` |
+| Client proxy | `ClientProxy` | `packages/microservices/client/client-proxy.ts` |
+| Lifecycle hooks | `OnModuleInit`, `OnApplicationBootstrap`, `OnModuleDestroy`, `BeforeApplicationShutdown`, `OnApplicationShutdown` | `packages/common/interfaces/hooks/*.interface.ts` |
+| Logger | `LoggerService` | `packages/common/services/logger.service.ts` |
+| Exception filter | `ExceptionFilter<T>` | `packages/common/interfaces/exceptions/exception-filter.interface.ts` |
+
+## Related pages
+
+- [Modules and Container](/di/modules-and-container) for how providers are registered and resolved
+- [Injector](/di/injector) for the resolution algorithm that consumes custom providers
+- [Metadata and Reflection](/di/metadata-and-reflection) for decorator internals and `Reflector`
+- [Scopes and InstanceWrapper](/di/scopes-and-instance-wrapper) for `Scope`, `durable`, and inject-time behavior
+- [Guards](/http/guards), [Interceptors](/http/interceptors), [Pipes](/http/pipes), [Exception Filters](/http/exception-filters) for individual enhancer mechanics

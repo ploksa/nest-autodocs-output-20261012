@@ -1,0 +1,307 @@
+---
+title: "DiscoveryService and Application Graph Inspector"
+sidebarTitle: "Discovery and Inspector"
+description: "How Nest discovery utilities inspect providers, controllers, and metadata, and how GraphInspector builds a serializable application graph for debugging and introspection."
+---
+
+Nest exposes two complementary introspection tools. `DiscoveryService` lets you enumerate providers, controllers, and metadata inside a running application. `GraphInspector` and `SerializedGraph` capture the full module topology so you can inspect, snapshot, or visualize how classes are wired together.
+
+### Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/discovery/discovery-service.ts` | Main API for discovering providers, controllers, and metadata |
+| `packages/core/discovery/discoverable-meta-host-collection.ts` | Static bookkeeping that links decorated classes to metadata keys |
+| `packages/core/discovery/discovery-module.ts` | Re-exports `DiscoveryService` and `MetadataScanner` as a module |
+| `packages/core/inspector/graph-inspector.ts` | Walks the container and records nodes and edges |
+| `packages/core/inspector/serialized-graph.ts` | Stores nodes, edges, entrypoints, and extras as a serializable graph |
+| `packages/core/inspector/noop-graph-inspector.ts` | Proxy that silently discards all graph operations |
+| `packages/core/inspector/partial-graph.host.ts` | Holds a graph snapshot when compilation fails |
+| `packages/core/repl/repl.ts` | Top-level `repl` function that starts an interactive Nest shell |
+| `packages/core/repl/repl-context.ts` | Builds the REPL scope and registers native commands |
+| `packages/core/repl/native-functions/get-repl-fn.ts` | `get` native command (and `$` alias) |
+| `packages/core/repl/native-functions/resolve-repl-fn.ts` | `resolve` native command for scoped instances |
+| `packages/core/repl/native-functions/select-relp-fn.ts` | `select` native command for module navigation |
+| `packages/core/repl/native-functions/debug-repl-fn.ts` | `debug` native command for module inspection |
+| `packages/core/repl/native-functions/methods-repl-fn.ts` | `methods` native command for listing public methods |
+
+## DiscoveryService
+
+`DiscoveryService` is injectable and exported by `DiscoveryModule`. Its constructor receives `ModulesContainer`, so it can see every module in the application. The public API has three main methods:
+
+### getProviders and getControllers
+
+Both accept an optional `DiscoveryOptions` shape that is either:
+
+- `FilterByInclude`: `{ include: [CatModule, DogModule] }`
+- `FilterByMetadataKey`: `{ metadataKey: string }`
+
+When `metadataKey` is passed, the method looks up a pre-computed collection managed by `DiscoverableMetaHostCollection` instead of flattening all modules.
+
+```ts packages/core/discovery/discovery-service.ts
+  public getProviders(
+    options: DiscoveryOptions = {},
+    modules: Module[] = this.getModules(options),
+  ): InstanceWrapper[] {
+    if ('metadataKey' in options) {
+      const providers = DiscoverableMetaHostCollection.getProvidersByMetaKey(
+        this.modulesContainer,
+        options.metadataKey!,
+      );
+      return Array.from(providers);
+    }
+    const providers = modules.map(item => [...item.providers.values()]);
+    return flatten(providers);
+  }
+```
+
+### Discoverable decorators
+
+`DiscoveryService.createDecorator` returns a strongly typed decorator factory that also registers the decorated class in the global `metaHostLinks` map. This makes the class findable later without scanning every `providers` map.
+
+```ts packages/core/discovery/discovery-service.ts
+  static createDecorator<T>(): DiscoverableDecorator<T> {
+    const metadataKey = uid(21);
+    const decoratorFn = (opts: T) => (target, key?, descriptor?) => {
+      if (!descriptor) {
+        DiscoverableMetaHostCollection.addClassMetaHostLink(
+          target as Function,
+          metadataKey,
+        );
+      }
+      SetMetadata(metadataKey, opts ?? {})(target, key!, descriptor);
+    };
+    decoratorFn.KEY = metadataKey;
+    return decoratorFn as DiscoverableDecorator<T>;
+  }
+```
+
+The metadata key is a 21-character random string. If the decorator is applied to a class (no `descriptor`), the class-to-key link is stored in `DiscoverableMetaHostCollection.metaHostLinks`. Later, when providers or controllers are registered, `NestContainer` calls `inspectProvider` / `inspectController`, which checks whether the class reference has a linked key and, if so, inserts the wrapper into the keyed collection.
+
+### getMetadataByDecorator
+
+Retrieves the metadata value for a given instance wrapper and an optional method key:
+
+```ts packages/core/discovery/discovery-service.ts
+  public getMetadataByDecorator<T extends DiscoverableDecorator<any>>(
+    decorator: T,
+    instanceWrapper: InstanceWrapper,
+    methodKey?: string,
+  ): T extends DiscoverableDecorator<infer R> ? R | undefined : T | undefined {
+    if (methodKey) {
+      return Reflect.getMetadata(
+        decorator.KEY,
+        instanceWrapper.instance[methodKey],
+      );
+    }
+    const clsRef =
+      instanceWrapper.instance?.constructor ?? instanceWrapper.metatype;
+    return Reflect.getMetadata(decorator.KEY, clsRef);
+  }
+```
+
+## GraphInspector
+
+`GraphInspector` turns the runtime module tree into a structured graph. It is instantiated only when `snapshot: true` is requested. Otherwise the framework uses `NoopGraphInspector`, which is a Proxy over `GraphInspector.prototype` that returns a no-op for every property access.
+
+### Graph construction
+
+```ts packages/core/inspector/graph-inspector.ts
+  public inspectModules(
+    modules: Map<string, Module> = this.container.getModules(),
+  ) {
+    for (const moduleRef of modules.values()) {
+      this.insertModuleNode(moduleRef);
+      this.insertClassNodes(moduleRef);
+      this.insertModuleToModuleEdges(moduleRef);
+    }
+    this.enhancersMetadataCache.forEach(entry =>
+      this.insertEnhancerEdge(entry),
+    );
+    DeterministicUuidRegistry.clear();
+  }
+```
+
+During scanning, the inspector also records:
+
+- **Constructor/property edges**: when `inspectInstanceWrapper` is called, it reads `wrapper.getCtorMetadata()` and `wrapper.getPropertiesMetadata()` and inserts `class-to-class` edges.
+- **Enhancer edges**: guards, interceptors, pipes, and filters attached to controllers or providers are cached first (because enhancers may be registered after the class node) and then flushed into the graph.
+- **Entrypoints**: route definitions (controller methods) are inserted as `Entrypoint` nodes keyed by their parent controller.
+- **Orphaned enhancers**: enhancers that are registered globally but not attached to any class.
+
+### Node and edge metadata
+
+Every `ClassNode` carries rich metadata:
+
+```ts packages/core/inspector/graph-inspector.ts
+metadata: {
+  type: 'provider' | 'controller' | 'middleware' | 'injectable',
+  internal: boolean,
+  sourceModuleName: string,
+  durable: boolean,
+  static: boolean,
+  scope: Scope,
+  transient: boolean,
+  exported: boolean,
+  token: InjectionToken,
+  subtype: string,
+  initTime: number,
+  enhancers?: Array<
+    | { id: string; methodKey: string; subtype: string }
+    | { name: string; methodKey?: string; subtype: string }
+  >,
+}
+```
+
+Edges record the injection type (`constructor`, `property`, or `decorator`) and the key or index at which the dependency appears.
+
+## SerializedGraph and PartialGraphHost
+
+`SerializedGraph` is a plain data store owned by `NestContainer`.
+
+```ts packages/core/inspector/serialized-graph.ts
+export class SerializedGraph {
+  private readonly nodes = new Map<string, Node>();
+  private readonly edges = new Map<string, Edge>();
+  private readonly entrypoints = new Map<string, Entrypoint<unknown>[]>();
+  private readonly extras: Extras = {
+    orphanedEnhancers: [],
+    attachedEnhancers: [],
+  };
+  private _status: SerializedGraphStatus = 'complete';
+  // ...
+}
+```
+
+It has internal awareness of core providers (such as `Reflector`, `ModuleRef`, `HttpAdapterHost`) and marks them as `internal: true` so they can be filtered out by visualizers.
+
+If a compilation error occurs while `snapshot: true` is active, `GraphInspector.registerPartial` flips the graph status to `'partial'` and records the cause. The graph is then stored in `PartialGraphHost`, which exposes static `toJSON()` and `toString()` helpers:
+
+```ts packages/core/inspector/partial-graph.host.ts
+export class PartialGraphHost {
+  private static partialGraph: SerializedGraph;
+
+  static toJSON() {
+    return this.partialGraph?.toJSON();
+  }
+
+  static toString() {
+    return this.partialGraph?.toString();
+  }
+
+  static register(partialGraph: SerializedGraph) {
+    this.partialGraph = partialGraph;
+  }
+}
+```
+
+## REPL
+
+The `repl` utility transforms any Nest module into an interactive Node.js REPL environment. It uses `NestFactory.createApplicationContext`, initializes the context, and injects a set of native commands plus auto-complete entries for every module, provider, and controller.
+
+```ts packages/core/repl/repl.ts
+export async function repl(
+  module: Type | DynamicModule,
+  replOptions: ReplOptions = {},
+) {
+  const app = await NestFactory.createApplicationContext(module, {
+    abortOnError: false,
+    logger: new ReplLogger(),
+  });
+  await app.init();
+
+  const replContext = new ReplContext(app);
+  // ...
+  const replServer = _repl.start({
+    prompt: clc.green('> '),
+    ignoreUndefined: true,
+    ...replOptions,
+  });
+  assignToObject(replServer.context, replContext.globalScope);
+  defineDefaultCommandsOnRepl(replServer);
+  return replServer;
+}
+```
+
+### Native commands
+
+`ReplContext` registers six built-in commands. Each is an instance of a class that subclasses `ReplFunction` and is bound into the REPL's global scope.
+
+| Command | Alias | Signature | Purpose |
+| --- | --- | --- | --- |
+| `get` | `$` | `(token) => any` | Retrieve a singleton provider or controller |
+| `resolve` | - | `(token, contextId) => Promise<any>` | Resolve a request-scoped or transient instance |
+| `select` | - | `(token) => INestApplicationContext` | Navigate to a child module |
+| `debug` | - | `(moduleCls?) => void` | Print controllers and providers per module |
+| `methods` | - | `(token) => void` | List public methods of a provider or controller |
+| `help` | - | - | Show usage for all commands |
+
+`get` and `resolve` map directly to `NestApplicationContext.get` and `NestApplicationContext.resolve`. `select` lets you drill into a specific module's injector subtree. `debug` reads from `ReplContext.debugRegistry`, which was populated by walking the `ModulesContainer` during initialization.
+
+## Usage examples
+
+### Using DiscoveryService in a script
+
+```ts
+import { DiscoveryModule, DiscoveryService } from '@nestjs/core';
+import { Module } from '@nestjs/common';
+
+const MyDecorator = DiscoveryService.createDecorator<{ role: string }>();
+
+@MyDecorator({ role: 'worker' })
+@Injectable()
+class WorkerService {}
+
+@Module({
+  imports: [DiscoveryModule],
+  providers: [WorkerService],
+})
+class AppModule {}
+
+const app = await NestFactory.createApplicationContext(AppModule);
+const discovery = app.get(DiscoveryService);
+
+const workers = discovery.getProviders({ metadataKey: MyDecorator.KEY });
+for (const w of workers) {
+  const meta = discovery.getMetadataByDecorator(MyDecorator, w);
+  console.log(meta.role); // 'worker'
+}
+```
+
+### Enabling a graph snapshot
+
+```ts
+const moduleRef = await Test.createTestingModule({
+  imports: [AppModule],
+}).compile({ snapshot: true });
+
+const container = (moduleRef as any).container;
+const graph = container.serializedGraph.toJSON();
+console.log(Object.keys(graph.nodes));
+```
+
+### Starting the REPL
+
+```ts
+import { repl } from '@nestjs/core';
+
+async function bootstrap() {
+  await repl(AppModule);
+}
+bootstrap();
+```
+
+Inside the REPL you can run commands like:
+
+```text
+> get(SomeService)
+> select(FeatureModule).get(FeatureService)
+> debug(FeatureModule)
+> methods(SomeController)
+```
+
+## Related pages
+
+- [Modules and Container](/di/modules-and-container) for `NestContainer` and `ModulesContainer`
+- [Metadata and Reflection](/di/metadata-and-reflection) for `Reflector` and `SetMetadata`
+- [Scopes and InstanceWrapper](/di/scopes-and-instance-wrapper) for the metadata that appears on graph nodes

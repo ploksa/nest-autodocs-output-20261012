@@ -1,0 +1,250 @@
+---
+title: "Scopes, InstanceWrapper, and Context IDs"
+sidebarTitle: "Scopes & InstanceWrapper"
+description: "Explore how Nest manages provider instances across scopes (DEFAULT, REQUEST, TRANSIENT) with InstanceWrapper, ContextId, durable providers, and the INQUIRER token."
+---
+
+Nest tracks every provider and controller inside an `InstanceWrapper`. Each wrapper stores not only the class metatype and its resolved instance, but also how that instance should behave with respect to lifetime: singleton, request-scoped, or transient. This page walks through the core data structures and algorithms that implement these scopes.
+
+## InstanceWrapper
+
+`InstanceWrapper` lives in `packages/core/injector/instance-wrapper.ts` and is the smallest unit of the dependency graph. It stores:
+
+- `token` and `name`: the injection key and display name.
+- `metatype`: the class constructor, factory function, or `null` for value providers.
+- `scope`: one of `Scope.DEFAULT`, `Scope.REQUEST`, or `Scope.TRANSIENT`.
+- `durable`: a boolean only valid when `scope === Scope.REQUEST`.
+- `host`: the `Module` that owns this wrapper.
+- `inject`: the injection tokens for factory providers.
+- `forwardRef`: whether the provider was declared with `forwardRef`.
+
+Instances are not stored as a single property. Instead, `InstanceWrapper` keeps a `WeakMap<ContextId, InstancePerContext<T>>` called `values`:
+
+```ts packages/core/injector/instance-wrapper.ts
+private readonly values = new WeakMap<ContextId, InstancePerContext<T>>();
+```
+
+`InstancePerContext` contains the actual `instance`, a boolean `isResolved`, a `donePromise` for async constructors, and `isConstructorCalled`. Because the map is keyed by `ContextId`, the same wrapper can hold many instances without leaking memory after the context object is garbage collected.
+
+### STATIC_CONTEXT
+
+When the application boots, all singletons are stored under a frozen context object called `STATIC_CONTEXT` defined in `packages/core/injector/constants.ts`:
+
+```ts packages/core/injector/constants.ts
+const STATIC_CONTEXT_ID = 1;
+export const STATIC_CONTEXT: ContextId = Object.freeze({
+  id: STATIC_CONTEXT_ID,
+});
+```
+
+The getter `instance` on `InstanceWrapper` is a convenience shorthand that reads from `STATIC_CONTEXT`:
+
+```ts packages/core/injector/instance-wrapper.ts
+get instance(): T {
+  const instancePerContext = this.getInstanceByContextId(STATIC_CONTEXT);
+  return instancePerContext.instance;
+}
+```
+
+## Scope enum
+
+The three possible lifetimes are declared in `packages/common/interfaces/scope-options.interface.ts`:
+
+```ts packages/common/interfaces/scope-options.interface.ts
+export enum Scope {
+  DEFAULT,
+  TRANSIENT,
+  REQUEST,
+}
+```
+
+| Scope | Behavior |
+| --- | --- |
+| `DEFAULT` | Shared singleton for the entire application. Instantiated once at bootstrap. |
+| `REQUEST` | One instance per HTTP request (or per custom context). The provider can optionally be marked `durable`. |
+| `TRANSIENT` | A new instance every time the provider is injected. For a transient provider inside a singleton, a single instance is created per singleton host. |
+
+You set the scope through the `@Injectable({ scope: Scope.REQUEST })` decorator. The decorator writes the metadata under the key `SCOPE_OPTIONS_METADATA`, which is later read by helper functions.
+
+## ContextId and ContextIdFactory
+
+Every request-scoped resolution needs an identifier that groups together all providers created for that single request. `ContextId` is a simple object with an `id: number` and optional `payload` and `getParent` fields:
+
+```ts packages/core/injector/instance-wrapper.ts
+export interface ContextId {
+  readonly id: number;
+  payload?: unknown;
+  getParent?(info: HostComponentInfo): ContextId;
+}
+```
+
+`ContextIdFactory` in `packages/core/helpers/context-id-factory.ts` generates these identifiers. Its `create()` method returns `{ id: Math.random() }`. When `getByRequest(request)` is called, it first checks whether the request object (or `request.raw`) already carries a symbol property `REQUEST_CONTEXT_ID`. If not, and if a custom strategy was registered with `ContextIdFactory.apply(strategy)`, the strategy may attach a parent context via `getParent` and a payload.
+
+```ts packages/core/helpers/context-id-factory.ts
+export interface ContextIdStrategy<T = any> {
+  attach(
+    contextId: ContextId,
+    request: T,
+  ): ContextIdResolverFn | ContextIdResolver | undefined;
+}
+```
+
+A custom strategy is the entry point for building **durable request-scoped trees**.
+
+## isDependencyTreeStatic
+
+Not every provider explicitly declares `Scope.REQUEST`. A provider becomes request-scoped implicitly when any of its transitive dependencies is request-scoped. `InstanceWrapper.isDependencyTreeStatic()` computes this lazily:
+
+```ts packages/core/injector/instance-wrapper.ts
+public isDependencyTreeStatic(lookupRegistry: string[] = []): boolean {
+  if (!isUndefined(this.isTreeStatic)) {
+    return this.isTreeStatic;
+  }
+  if (this.scope === Scope.REQUEST) {
+    this.isTreeStatic = false;
+    this.printIntrospectedAsRequestScoped();
+    return this.isTreeStatic;
+  }
+  this.isTreeStatic = !this.introspectDepsAttribute(
+    (collection, registry) =>
+      collection.some(
+        (item: InstanceWrapper) => !item.isDependencyTreeStatic(registry),
+      ),
+    lookupRegistry,
+  );
+  // ...
+}
+```
+
+The method caches the result in `this.isTreeStatic`. If a request-scoped provider is anywhere in the constructor, property, or enhancer graph, the entire branch is marked non-static. To keep caches correct after dynamic metadata changes, `addCtorMetadata`, `addPropertiesMetadata`, and `addEnhancerMetadata` all call `resetDependencyTreeState()`, which walks a `WeakMap` of parent wrappers and invalidates their cache recursively.
+
+## Durable providers
+
+A normal request-scoped provider is recreated for every request. A **durable** provider is still request-scoped, but it can share a single instance across multiple requests when a `ContextIdStrategy` maps those requests to the same parent context. The `durable` flag is read from decorator metadata by `isDurable` in `packages/core/helpers/is-durable.ts`:
+
+```ts packages/core/helpers/is-durable.ts
+export function isDurable(provider: Type<unknown>): boolean | undefined {
+  const metadata = Reflect.getMetadata(SCOPE_OPTIONS_METADATA, provider);
+  return metadata && metadata.durable;
+}
+```
+
+`InstanceWrapper.isDependencyTreeDurable()` evaluates whether the entire dependency subtree rooted at this wrapper can be treated as durable. The logic mirrors `isDependencyTreeStatic` but looks for a `durable === true` flag on `REQUEST`-scoped nodes. If every non-static dependency is durable, the wrapper returns `true`, and Nest may reuse instances across requests via `getParent(contextId)`.
+
+## Transient handling
+
+For `TRANSIENT` providers, a single `ContextId` is not enough: the same wrapper may be injected into many different parents. `InstanceWrapper` therefore uses a second-level map called `transientMap`:
+
+```ts packages/core/injector/instance-wrapper.ts
+private transientMap?: Map<string, WeakMap<ContextId, InstancePerContext<T>>>;
+```
+
+The outer key is the **inquirer id** (a string identifying the parent wrapper that asked for this dependency). The inner key is the `ContextId`. This means a transient provider injected into two different singletons gets two independent instance chains, and each chain can still be request-scoped if the parent itself is request-scoped.
+
+`getInstanceByContextId` branches on `scope === Scope.TRANSIENT`:
+
+```ts packages/core/injector/instance-wrapper.ts
+public getInstanceByContextId(
+  contextId: ContextId,
+  inquirerId?: string,
+): InstancePerContext<T> {
+  if (this.scope === Scope.TRANSIENT && inquirerId) {
+    return this.getInstanceByInquirerId(contextId, inquirerId);
+  }
+  // ...
+}
+```
+
+If no instance exists yet for the given pair, `cloneTransientInstance` creates a fresh prototype and stores it.
+
+## Inquirer and root inquirer
+
+When a transient provider is resolved, Nest needs to know which parent requested it. The `INQUIRER` token is a transient provider registered in every module by `packages/core/injector/inquirer/inquirer-providers.ts`:
+
+```ts packages/core/injector/inquirer/inquirer-providers.ts
+export const inquirerProvider: Provider = {
+  provide: INQUIRER,
+  scope: Scope.TRANSIENT,
+  useFactory: noop,
+};
+```
+
+During resolution the `Injector` sets the inquirer wrapper on the transient child so that the child can later look up its parent. `InstanceWrapper.attachRootInquirer(inquirer)` stores the **root** inquirer (the topmost non-transient ancestor):
+
+```ts packages/core/injector/instance-wrapper.ts
+public attachRootInquirer(inquirer: InstanceWrapper) {
+  if (!this.isTransient) {
+    return;
+  }
+  this.rootInquirer = inquirer.getRootInquirer() ?? inquirer;
+}
+```
+
+This is used by `isStatic` to decide whether a transient provider should behave as a singleton (when its root inquirer is non-transient) or as a true per-injection instance.
+
+## REQUEST provider
+
+The raw request object itself is available as a provider via the `REQUEST` token. `packages/core/router/request/request-providers.ts` registers it with `Scope.REQUEST`:
+
+```ts packages/core/router/request/request-providers.ts
+export const requestProvider: Provider = {
+  provide: REQUEST,
+  scope: Scope.REQUEST,
+  useFactory: noop,
+};
+```
+
+At runtime the actual request object is linked to the current `ContextId` through `NestContainer.registerRequestProvider(request, contextId)`. This is why you can inject `@Inject(REQUEST) private request` inside any request-scoped service.
+
+## Reading scope metadata
+
+Both `getClassScope` and `isDurable` read the `SCOPE_OPTIONS_METADATA` key written by `@Injectable` or `@Controller`:
+
+```ts packages/core/helpers/get-class-scope.ts
+export function getClassScope(provider: Type<unknown>): Scope {
+  const metadata = Reflect.getMetadata(SCOPE_OPTIONS_METADATA, provider);
+  return metadata && metadata.scope;
+}
+```
+
+If no metadata is present, the provider defaults to `Scope.DEFAULT`.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/injector/instance-wrapper.ts` | `InstanceWrapper` class: instance storage, scope detection, transient map, durable introspection. |
+| `packages/common/interfaces/scope-options.interface.ts` | `Scope` enum and `ScopeOptions` interface. |
+| `packages/core/injector/constants.ts` | `STATIC_CONTEXT` definition. |
+| `packages/core/helpers/context-id-factory.ts` | `ContextIdFactory`, `ContextIdStrategy`, `createContextId`. |
+| `packages/core/helpers/get-class-scope.ts` | Reads `scope` from class metadata. |
+| `packages/core/helpers/is-durable.ts` | Reads `durable` flag from class metadata. |
+| `packages/core/injector/inquirer/inquirer-constants.ts` | `INQUIRER` token string. |
+| `packages/core/injector/inquirer/inquirer-providers.ts` | Registration of the transient `INQUIRER` provider. |
+| `packages/core/router/request/request-constants.ts` | `REQUEST` token and `REQUEST_CONTEXT_ID` symbol. |
+| `packages/core/router/request/request-providers.ts` | Registration of the request-scoped `REQUEST` provider. |
+
+## Example: request-scoped and transient providers
+
+```ts
+@Injectable({ scope: Scope.REQUEST, durable: true })
+class DurableService {}
+
+@Injectable({ scope: Scope.TRANSIENT })
+class TransientHelper {
+  constructor(@Inject(INQUIRER) private parent: object) {}
+}
+
+@Injectable()
+class SingletonService {
+  constructor(private helper: TransientHelper) {}
+}
+```
+
+In this snippet:
+
+1. `DurableService` is request-scoped and durable. If a custom `ContextIdStrategy` maps two requests to the same parent context, they share the same `DurableService` instance.
+2. `TransientHelper` is transient and injects `INQUIRER` to learn which class created it. When `SingletonService` injects `TransientHelper`, a single `TransientHelper` instance is created for that singleton host.
+3. `SingletonService` itself is `DEFAULT` scoped, so one instance exists for the whole application.
+
+For a deeper look at how the injector uses these wrappers during actual resolution, see [Injector](/di/injector).

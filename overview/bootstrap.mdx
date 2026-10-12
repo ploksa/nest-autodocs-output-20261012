@@ -1,0 +1,298 @@
+---
+title: "Nest Bootstrap: From NestFactory.create() to listen()"
+sidebarTitle: "Bootstrap"
+description: "Trace Nest bootstrapping from NestFactory.create through container setup, module scanning, instance creation, middleware and route registration, and listen."
+---
+
+NestJS applications begin life in `NestFactory`, a static class that orchestrates the creation of the dependency-injection container, scans modules, instantiates providers, and wires up the HTTP server. This page traces the exact code path from `NestFactory.create()` to `app.listen()`, showing how each internal class hands off to the next.
+
+## Factory entry points
+
+`NestFactoryStatic` exposes three creation methods in `packages/core/nest-factory.ts`:
+
+1. `create()` -- builds an HTTP application (`NestApplication`).
+2. `createApplicationContext()` -- builds a headless context (`NestApplicationContext`) with no server.
+3. `createMicroservice()` -- builds a microservice transport (`NestMicroservice`).
+
+All three share the same initialization sequence but differ in what they instantiate afterward.
+
+## Shared initialization
+
+The `initialize()` method is the heart of bootstrap. It runs for every application type.
+
+```ts packages/core/nest-factory.ts
+private async initialize(
+  module: any,
+  container: NestContainer,
+  graphInspector: GraphInspector,
+  config = new ApplicationConfig(),
+  options: NestApplicationContextOptions = {},
+  httpServer: HttpServer | null = null,
+) {
+  UuidFactory.mode = options.snapshot
+    ? UuidFactoryMode.Deterministic
+    : UuidFactoryMode.Random;
+
+  const injector = new Injector({
+    preview: options.preview!,
+    snapshot: options.snapshot,
+    instanceDecorator: options.instrument?.instanceDecorator,
+  });
+  const instanceLoader = new InstanceLoader(
+    container,
+    injector,
+    graphInspector,
+  );
+  const metadataScanner = new MetadataScanner();
+  const dependenciesScanner = new DependenciesScanner(
+    container,
+    metadataScanner,
+    graphInspector,
+    config,
+  );
+  container.setHttpAdapter(httpServer);
+
+  const teardown = this.abortOnError === false ? rethrow : undefined;
+  await httpServer?.init?.();
+  try {
+    this.logger.log(MESSAGES.APPLICATION_START);
+
+    await ExceptionsZone.asyncRun(
+      async () => {
+        await dependenciesScanner.scan(module);
+        await instanceLoader.createInstancesOfDependencies();
+        dependenciesScanner.applyApplicationProviders();
+      },
+      teardown,
+      this.autoFlushLogs,
+    );
+  } catch (e) {
+    this.handleInitializationError(e);
+  }
+}
+```
+
+### Step-by-step initialization flow
+
+<Steps>
+  <Step title="Create container and config">
+    `NestContainer` is instantiated with `ApplicationConfig` and the user options. The container becomes the registry for all modules, providers, and controllers.
+  </Step>
+  <Step title="Create graph inspector">
+    If `snapshot: true` is passed, a real `GraphInspector` is created to record the static dependency graph. Otherwise a no-op inspector is used.
+  </Step>
+  <Step title="Scan dependencies">
+    `DependenciesScanner.scan(module)` walks the module tree recursively, registering providers, controllers, exports, and imports into the container.
+  </Step>
+  <Step title="Instantiate dependencies">
+    `InstanceLoader.createInstancesOfDependencies()` resolves constructor arguments and factory promises, calling `Injector.loadProvider()` and `Injector.loadController()` for every registered class.
+  </Step>
+  <Step title="Apply global providers">
+    `DependenciesScanner.applyApplicationProviders()` attaches globally configured guards, interceptors, pipes, and filters to `ApplicationConfig`.
+  </Step>
+</Steps>
+
+## HTTP application creation
+
+When you call `NestFactory.create(AppModule)`, the factory resolves an HTTP adapter, then constructs `NestApplication`.
+
+### Adapter selection
+
+If you do not pass an adapter, the factory loads the default Express adapter dynamically:
+
+```ts packages/core/nest-factory.ts
+private async createHttpAdapter<T = any>(
+  httpServer?: T,
+): Promise<AbstractHttpAdapter> {
+  const { ExpressAdapter } = await loadAdapter(
+    '@nestjs/platform-express',
+    'HTTP',
+    () => import('@nestjs/platform-express'),
+  );
+  return new ExpressAdapter(httpServer);
+}
+```
+
+If you pass a custom adapter as the second argument, `isHttpServer()` detects it by checking for the `patch` method and uses it directly.
+
+### NestApplication construction
+
+```ts packages/core/nest-factory.ts
+const instance = new NestApplication(
+  container,
+  httpServer,
+  applicationConfig,
+  graphInspector,
+  appOptions,
+);
+await instance.preloadLazyPackages();
+const target = this.createNestInstance(instance);
+return this.createAdapterProxy<T>(target, httpServer);
+```
+
+`preloadLazyPackages()` eagerly imports optional packages (`@nestjs/platform-express` and `@nestjs/microservices`) so that later synchronous calls do not need dynamic imports.
+
+## Proxy creation and error handling
+
+`createNestInstance()` wraps the application in two layers:
+
+1. An exception proxy (`createExceptionProxy`) that routes every property access through `ExceptionsZone.run()`.
+2. An adapter proxy (`createAdapterProxy`) that forwards unknown method calls to the underlying HTTP adapter.
+
+If `abortOnError` is `true` (the default), uncaught errors during initialization trigger `process.abort()`. If `false`, the error is re-thrown.
+
+## NestApplication.init()
+
+After `create()` resolves, you typically call `app.listen(port)`. That method first calls `init()` if the application has not been initialized yet.
+
+```ts packages/core/nest-application.ts
+public async init(): Promise<this> {
+  if (this.isInitialized) {
+    return this;
+  }
+
+  await Promise.all([
+    this.loadSocketModule(),
+    this.loadMicroservicesModule(),
+  ]);
+  this.applyOptions();
+  await this.httpAdapter?.init?.();
+
+  const useBodyParser =
+    this.appOptions && this.appOptions.bodyParser !== false;
+  useBodyParser && this.registerParserMiddleware();
+
+  await this.registerModules();
+  await this.registerRouter();
+  await this.callInitHook();
+  await this.registerRouterHooks();
+  await this.callBootstrapHook();
+
+  this.isInitialized = true;
+  this.logger.log(MESSAGES.APPLICATION_READY);
+  return this;
+}
+```
+
+### Step-by-step init flow
+
+<Steps>
+  <Step title="Load optional modules">
+    WebSocket (`SocketModule`) and microservices (`MicroservicesModule`) are imported dynamically if their packages are installed.
+  </Step>
+  <Step title="Apply adapter options">
+    CORS is configured if `appOptions.cors` is set, and the HTTP adapter is initialized.
+  </Step>
+  <Step title="Register parser middleware">
+    Body parser middleware is registered unless `bodyParser: false` is set.
+  </Step>
+  <Step title="Register modules">
+    `registerModules()` wires up WebSocket gateways, microservices, and middleware.
+  </Step>
+  <Step title="Register router">
+    `registerRouter()` resolves all controller routes and registers them on the HTTP adapter.
+  </Step>
+  <Step title="Call lifecycle hooks">
+    `callInitHook()` fires `OnModuleInit`, followed by `registerRouterHooks()` and `callBootstrapHook()` which fires `OnApplicationBootstrap`.
+  </Step>
+</Steps>
+
+## listen()
+
+Once `init()` completes, `listen()` starts the underlying Node.js HTTP server:
+
+```ts packages/core/nest-application.ts
+public async listen(port: number | string, ...args: any[]): Promise<any> {
+  this.assertNotInPreviewMode('listen');
+
+  if (!this.isInitialized) {
+    await this.init();
+  }
+
+  const httpAdapterHost = this.container.getHttpAdapterHostRef();
+  return new Promise((resolve, reject) => {
+    const errorHandler = (e: any) => {
+      this.logger.error(e?.toString?.());
+      reject(e);
+    };
+    this.httpServer.once('error', errorHandler);
+
+    this.httpAdapter.listen(
+      port,
+      ...listenFnArgs,
+      (...originalCallbackArgs: unknown[]) => {
+        if (this.appOptions?.autoFlushLogs ?? true) {
+          this.flushLogs();
+        }
+        // ...
+        httpAdapterHost.listening = true;
+        resolve(this.httpServer);
+      },
+    );
+  });
+}
+```
+
+The method guards against preview mode, auto-flushes buffered logs, and resolves once the server is listening.
+
+## Headless context: NestApplicationContext
+
+`NestApplicationContext` is the base class for both `NestApplication` and standalone contexts. It manages module selection, instance resolution, and lifecycle hooks.
+
+When you call `createApplicationContext()`:
+
+1. The same `initialize()` sequence runs.
+2. A `NestApplicationContext` is constructed with the container, options, and root module.
+3. `context.init()` is called, which triggers `OnModuleInit` and `OnApplicationBootstrap` hooks without any HTTP server setup.
+
+```ts packages/core/nest-factory.ts
+const context = this.createNestInstance<NestApplicationContext>(
+  new NestApplicationContext(container, options, root),
+);
+if (this.autoFlushLogs) {
+  context.flushLogsOnOverride();
+}
+return context.init();
+```
+
+## Bootstrap options
+
+The following options from `NestApplicationContextOptions` affect bootstrap behavior:
+
+| Option | Effect |
+| --- | --- |
+| `abortOnError` | If `false`, initialization errors are re-thrown instead of aborting the process. |
+| `bufferLogs` | Binds a log buffer so logs are deferred until `flushLogs()` is called. |
+| `autoFlushLogs` | Automatically flushes logs on bootstrap completion or error. Defaults to `true`. |
+| `preview` | Skips provider and controller instantiation. Useful for introspection tools. |
+| `snapshot` | Enables deterministic UUIDs and records the dependency graph via `GraphInspector`. |
+| `logger` | Overrides the default logger. Pass `false` to disable logging entirely. |
+| `forceConsole` | Forces `ConsoleLogger` to use `console.log` instead of `process.stdout`. |
+| `instrument.instanceDecorator` | A function that wraps every instance created by the container. |
+
+Additional HTTP-specific options in `NestApplicationOptions` include `cors`, `bodyParser`, `httpsOptions`, `rawBody`, `routeConflictPolicy`, and `routeResolutionStrategy`.
+
+## Source files
+
+| Path | Responsibility |
+| --- | --- |
+| `packages/core/nest-factory.ts` | `NestFactoryStatic`, entry points for all application types |
+| `packages/core/nest-application.ts` | `NestApplication`, HTTP server lifecycle, routing, middleware |
+| `packages/core/nest-application-context.ts` | `NestApplicationContext`, base context, module selection, hooks |
+| `packages/core/scanner.ts` | `DependenciesScanner`, module tree scanning |
+| `packages/core/injector/instance-loader.ts` | `InstanceLoader`, resolves and instantiates providers/controllers |
+| `packages/core/injector/injector.ts` | `Injector`, per-instance dependency resolution |
+| `packages/core/injector/container.ts` | `NestContainer`, module and provider registry |
+| `packages/core/application-config.ts` | `ApplicationConfig`, global enhancers and prefixes |
+| `packages/common/interfaces/nest-application-context-options.interface.ts` | `NestApplicationContextOptions` class |
+| `packages/common/interfaces/nest-application-options.interface.ts` | `NestApplicationOptions` interface |
+
+## Related pages
+
+- [Dependency Scanner](/di/dependency-scanner)
+- [Instance Loader](/di/instance-loader)
+- [Injector](/di/injector)
+- [Modules and Container](/di/modules-and-container)
+- [Lifecycle Hooks](/overview/lifecycle-hooks)
+- [Request Lifecycle](/http/request-lifecycle)
+- [Middleware](/http/middleware)

@@ -1,0 +1,409 @@
+---
+title: "HTTP Execution Context: RouterExecutionContext Internals"
+sidebarTitle: "Execution Context"
+description: "How Nest composes guards, pipes, interceptors, and response strategies into a per-request handler through RouterExecutionContext and ExecutionContextHost."
+---
+
+Every incoming HTTP request in Nest passes through a composed handler built by `RouterExecutionContext`. This class reads decorator metadata, assembles guards, pipes, and interceptors, extracts route parameters, and selects the correct response strategy (JSON, redirect, render, or SSE). This page explains the internals of that composition and the objects that support it.
+
+## Building the handler: RouterExecutionContext.create
+
+When `RouterExplorer` discovers a controller method, it calls `RouterExecutionContext.create` to build the function that will be registered on the HTTP adapter. The result is an async function with signature `(req, res, next) => Promise<void>`.
+
+```ts packages/core/router/router-execution-context.ts
+public create(
+  instance: Controller,
+  callback: (...args: any[]) => unknown,
+  methodName: string,
+  moduleKey: string,
+  requestMethod: RequestMethod,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+) {
+  const contextType: ContextType = 'http';
+  const {
+    argsLength,
+    fnHandleResponse,
+    isSseHandler,
+    paramtypes,
+    getParamsMetadata,
+    httpStatusCode,
+    responseHeaders,
+    hasCustomHeaders,
+  } = this.getMetadata(
+    instance,
+    callback,
+    methodName,
+    moduleKey,
+    requestMethod,
+    contextType,
+  );
+
+  const paramsOptions = this.contextUtils.mergeParamsMetatypes(
+    getParamsMetadata(moduleKey, contextId, inquirerId),
+    paramtypes,
+  );
+  const pipes = this.pipesContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  const guards = this.guardsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  const interceptors = this.interceptorsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+
+  const fnCanActivate = this.createGuardsFn(guards, instance, callback, contextType);
+  const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+
+  const handler =
+    <TRequest, TResponse>(
+      args: any[], req: TRequest, res: TResponse, next: Function,
+    ) =>
+    async () => {
+      fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+      return callback.apply(instance, args);
+    };
+
+  return async <TRequest, TResponse>(
+    req: TRequest, res: TResponse, next: Function,
+  ) => {
+    const args = this.contextUtils.createNullArray(argsLength);
+    fnCanActivate && (await fnCanActivate([req, res, next]));
+
+    this.responseController.setStatus(res, httpStatusCode);
+    hasCustomHeaders && this.responseController.setHeaders(res, responseHeaders);
+
+    if (isSseHandler) {
+      this.attachSseAbortSignal(req);
+    }
+
+    const resultOrDeferred = this.interceptorsConsumer.intercept(
+      interceptors, [req, res, next], instance, callback,
+      handler(args, req, res, next), contextType,
+    );
+    const result = isSseHandler ? resultOrDeferred : await resultOrDeferred;
+    await (fnHandleResponse as HandlerResponseBasicFn)(result, res, req);
+  };
+}
+```
+
+The control flow for every request is:
+
+<Steps>
+  <Step title="Create argument array">
+    A `null` array of length `argsLength` is created to hold decorator-extracted values.
+  </Step>
+  <Step title="Run guards">
+    `fnCanActivate` invokes every guard. If any returns `false`, a `ForbiddenException` is thrown.
+  </Step>
+  <Step title="Set status and headers">
+    The default or `@HttpCode` status is applied, plus any `@Header()` values.
+  </Step>
+  <Step title="Attach SSE signal (if needed)">
+    For `@Sse()` handlers, an `AbortController` is attached so the handler can observe disconnects via `@SseSignal()`.
+  </Step>
+  <Step title="Intercept">
+    Interceptors run around the handler through `InterceptorsConsumer.intercept`, producing an RxJS chain.
+  </Step>
+  <Step title="Apply pipes">
+    Inside the inner handler, `fnApplyPipes` extracts values from `req`/`res`/`next` and runs them through pipes.
+  </Step>
+  <Step title="Call controller method">
+    The controller method is invoked with the populated `args` array.
+  </Step>
+  <Step title="Handle response">
+    `fnHandleResponse` decides how to serialize the result (JSON, redirect, render, or SSE).
+  </Step>
+</Steps>
+
+## Metadata caching with HandlerMetadataStorage
+
+`getMetadata` reads reflection metadata and caches the result in `HandlerMetadataStorage` to avoid repeated reflection on every request:
+
+```ts packages/core/helpers/handler-metadata-storage.ts
+export interface HandlerMetadata {
+  argsLength: number;
+  isSseHandler: boolean;
+  paramtypes: any[];
+  httpStatusCode: number;
+  responseHeaders: any[];
+  hasCustomHeaders: boolean;
+  getParamsMetadata: (
+    moduleKey: string,
+    contextId?: ContextId,
+    inquirerId?: string,
+  ) => (ParamProperties & { metatype?: any })[];
+  fnHandleResponse: HandleResponseFn;
+}
+```
+
+The cache key is the controller constructor name plus the method name, so metadata is computed once per application lifecycle.
+
+## Parameter extraction
+
+### RouteParamsFactory
+
+`RouteParamsFactory` maps each `RouteParamtypes` enum value to the corresponding property on the request object:
+
+```ts packages/core/router/route-params-factory.ts
+public exchangeKeyForValue<
+  TRequest extends Record<string, any> = any,
+  TResponse = any,
+  TResult = any,
+>(
+  key: RouteParamtypes | string,
+  data: string,
+  { req, res, next }: { req: TRequest; res: TResponse; next: Function },
+): TResult | null {
+  switch (key) {
+    case RouteParamtypes.NEXT: return next as any;
+    case RouteParamtypes.REQUEST: return req as any;
+    case RouteParamtypes.RESPONSE: return res as any;
+    case RouteParamtypes.BODY: return data && req.body ? req.body[data] : req.body;
+    case RouteParamtypes.PARAM: return data ? req.params[data] : req.params;
+    case RouteParamtypes.QUERY: return data ? req.query[data] : req.query;
+    case RouteParamtypes.HEADERS: return data ? req.headers[data.toLowerCase()] : req.headers;
+    // ...SESSION, FILE, FILES, IP, HOST
+    default: return null;
+  }
+}
+```
+
+### Custom parameter decorators
+
+`createParamDecorator` generates a decorator that stores a custom factory under `CUSTOM_ROUTE_ARGS_METADATA`:
+
+```ts packages/common/decorators/http/create-route-param-metadata.decorator.ts
+export function createParamDecorator<FactoryData = any, FactoryOutput = any>(
+  factory: CustomParamFactory<FactoryData, FactoryOutput>,
+  enhancers: ParamDecoratorEnhancer[] = [],
+): (...) => ParameterDecorator {
+  const paramtype = uid(21);
+  return (data?, ...pipes?) => (target, key, index) => {
+    // ...builds metadata entry
+    Reflect.defineMetadata(
+      ROUTE_ARGS_METADATA,
+      assignCustomParameterMetadata(args, paramtype, index, factory, finalData, finalSchema, ...finalPipes),
+      target.constructor, key!,
+    );
+  };
+}
+```
+
+During request handling, `exchangeKeysForValues` detects `CUSTOM_ROUTE_ARGS_METADATA` keys and invokes the factory with the current `ExecutionContextHost`:
+
+```ts packages/core/router/router-execution-context.ts
+if (key.includes(CUSTOM_ROUTE_ARGS_METADATA)) {
+  const { factory } = metadata[key];
+  const customExtractValue = this.contextUtils.getCustomFactory(
+    factory, data, contextFactory!,
+  );
+  return { index, extractValue: customExtractValue, type, data, pipes, schema };
+}
+```
+
+## Pipe application
+
+`createPipesFn` produces a function that resolves every decorated parameter in parallel. Each parameter has its own `extractValue` function (from `RouteParamsFactory` or a custom decorator) and its own pipe list.
+
+```ts packages/core/router/router-execution-context.ts
+public createPipesFn(
+  pipes: PipeTransform[],
+  paramsOptions: (ParamProperties & { metatype?: any })[],
+) {
+  const pipesFn = async (args, req, res, next) => {
+    const resolveParamValue = async (param) => {
+      const { index, extractValue, type, data, metatype, pipes: paramPipes, schema } = param;
+      const value = extractValue(req, res, next);
+      args[index] = this.isPipeable(type)
+        ? await this.getParamValue(value, { metatype, type, data, schema }, pipes.concat(paramPipes))
+        : value;
+    };
+    await Promise.all(paramsOptions.map(resolveParamValue));
+  };
+  return paramsOptions.length ? pipesFn : null;
+}
+```
+
+`isPipeable` returns `true` for body, query, param, file, files, raw body, and custom decorators, meaning those types run through the pipe chain. `REQUEST`, `RESPONSE`, and `NEXT` skip pipes.
+
+## Response strategies
+
+`createHandleResponseFn` selects the response strategy based on metadata:
+
+| Metadata | Strategy |
+| --- | --- |
+| `@Render()` | `responseController.render(result, res, template)` |
+| `@Redirect()` | `responseController.redirect(result, res, redirectResponse)` |
+| `@Sse()` | `responseController.sse(result, rawResponse, req, options)` |
+| None | `responseController.apply(result, res, httpStatusCode)` |
+
+### SSE handling
+
+`RouterResponseController.sse` wraps the returned `Observable` in an `SseStream` that transforms `MessageEvent` objects into W3C Server-Sent Events format.
+
+```ts packages/core/router/sse-stream.ts
+export class SseStream extends Transform {
+  _transform(message: MessageEvent, encoding: string, callback) {
+    this.commitHeaders();
+    let data = message.type ? `event: ${sanitize(message.type)}\n` : '';
+    data += !isNil(message.id) ? `id: ${sanitize(message.id)}\n` : '';
+    data += !isNil(message.retry) ? `retry: ${sanitize(message.retry)}\n` : '';
+    data += !isNil(message.comment) ? toCommentString(message.comment) : '';
+    data += !isNil(message.data) ? toDataString(message.data) : '';
+    data += '\n';
+    this.push(data);
+    callback();
+  }
+}
+```
+
+Headers are deferred until the first message so that an early error can still be caught by exception filters and change the HTTP status code.
+
+## ExecutionContextHost
+
+Guards, interceptors, and pipes receive an `ExecutionContext` created by `ContextUtils.getContextFactory`:
+
+```ts packages/core/helpers/context-utils.ts
+public getContextFactory<TContext extends string = ContextType>(
+  contextType: TContext,
+  instance?: object,
+  callback?: Function,
+): (args: unknown[]) => ExecutionContextHost {
+  const type = instance && (instance.constructor as Type<unknown>);
+  return (args: unknown[]) => {
+    const ctx = new ExecutionContextHost(args, type, callback);
+    ctx.setType(contextType);
+    return ctx;
+  };
+}
+```
+
+`ExecutionContextHost` stores the raw `[req, res, next]` array and exposes typed views:
+
+```ts packages/core/helpers/execution-context-host.ts
+export class ExecutionContextHost implements ExecutionContext {
+  getType<TContext extends string = ContextType>(): TContext {
+    return this.contextType as TContext;
+  }
+  getClass<T = any>(): Type<T> {
+    return this.constructorRef!;
+  }
+  getHandler(): Function {
+    return this.handler!;
+  }
+  switchToHttp(): HttpArgumentsHost {
+    return Object.assign(this, {
+      getRequest: () => this.getArgByIndex(0),
+      getResponse: () => this.getArgByIndex(1),
+      getNext: () => this.getArgByIndex(2),
+    });
+  }
+  switchToRpc(): RpcArgumentsHost { ... }
+  switchToWs(): WsArgumentsHost { ... }
+}
+```
+
+The same class is reused for HTTP, RPC, and WebSocket contexts. The `type` field determines which `switchTo*` view is meaningful.
+
+## ExternalContextCreator
+
+`ExternalContextCreator` provides the same guard, pipe, and interceptor composition for callers outside the HTTP request lifecycle. It is used internally for custom transports and external integrations. The main differences are:
+
+- It accepts a `paramsFactory` to extract arguments from arbitrary inputs.
+- It uses `ExternalExceptionFilterContext` instead of `RouterExceptionFilters`.
+- Options `guards`, `interceptors`, and `filters` can be toggled per call.
+
+```ts packages/core/helpers/external-context-creator.ts
+public create(
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  methodName: string,
+  metadataKey?: string,
+  paramsFactory?: ParamsFactory,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+  options: ExternalContextOptions = { interceptors: true, guards: true, filters: true },
+  contextType: TContext = 'http' as TContext,
+) {
+  // ...metadata, pipes, guards, interceptors, exception filter composition
+}
+```
+
+## Example: controller that exercises the pipeline
+
+```ts
+@Controller('orders')
+export class OrdersController {
+  constructor(private readonly ordersService: OrdersService) {}
+
+  @Post()
+  @HttpCode(202)
+  @Header('X-Rate-Limit', '100')
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(TransformInterceptor)
+  async create(
+    @Body(new ValidationPipe()) dto: CreateOrderDto,
+    @CustomParamDecorator() customValue: string,
+  ) {
+    return this.ordersService.create(dto, customValue);
+  }
+
+  @Get('stream')
+  @Sse()
+  streamEvents(): Observable<MessageEvent> {
+    return interval(1000).pipe(
+      map(() => ({ data: { time: new Date().toISOString() } })),
+    );
+  }
+}
+```
+
+For the `create` method, `RouterExecutionContext.create` will:
+
+1. Cache metadata: `argsLength = 2`, `httpStatusCode = 202`, `hasCustomHeaders = true`.
+2. Build `fnCanActivate` from `JwtAuthGuard`.
+3. Build `fnApplyPipes` that runs `ValidationPipe` over the `@Body()` value.
+4. Produce a response handler that calls `responseController.apply(result, res, 202)`.
+
+For the `streamEvents` method, it will:
+
+1. Mark `isSseHandler = true`.
+2. Attach an `AbortController` to the request.
+3. Use `responseController.sse` to pipe the `Observable` through `SseStream`.
+
+## Response handling detection
+
+`isResponseHandled` determines whether Nest should skip automatic response serialization because the handler has taken control of `res` directly:
+
+```ts packages/core/router/router-execution-context.ts
+private isResponseHandled(
+  instance: Controller,
+  methodName: string,
+  paramsMetadata: ParamProperties[],
+): boolean {
+  const hasResponseOrNextDecorator = paramsMetadata.some(
+    ({ type }) => type === RouteParamtypes.RESPONSE || type === RouteParamtypes.NEXT,
+  );
+  const isPassthroughEnabled = this.contextUtils.reflectPassthrough(instance, methodName);
+  return hasResponseOrNextDecorator && !isPassthroughEnabled;
+}
+```
+
+If `@Res({ passthrough: true })` is used, Nest continues to serialize the return value even though the response object is injected.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/router/router-execution-context.ts` | Composes the full per-request handler from metadata and enhancers |
+| `packages/core/helpers/execution-context-host.ts` | Provides `ExecutionContext` implementation for guards, interceptors, and pipes |
+| `packages/core/helpers/context-utils.ts` | Reads metadata, maps param types, builds context factories |
+| `packages/core/helpers/context-creator.ts` | Base class for merging global, class-level, and method-level metadata |
+| `packages/core/helpers/external-context-creator.ts` | Same composition pipeline for non-HTTP contexts (external callers) |
+| `packages/core/helpers/handler-metadata-storage.ts` | Caches `HandlerMetadata` per controller method |
+| `packages/core/router/route-params-factory.ts` | Extracts parameter values from `req`, `res`, and `next` |
+| `packages/core/router/router-response-controller.ts` | Applies status codes, headers, redirects, renders, and SSE |
+| `packages/core/router/sse-stream.ts` | Transforms `MessageEvent` objects into W3C event stream content |
+| `packages/common/decorators/http/create-route-param-metadata.decorator.ts` | Factory for `@Param`, `@Body`, and custom parameter decorators |
