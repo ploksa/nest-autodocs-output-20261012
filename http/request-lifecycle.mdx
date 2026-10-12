@@ -1,0 +1,476 @@
+---
+title: "HTTP Request Lifecycle: End-to-End Handoffs in Nest"
+sidebarTitle: "Request Lifecycle"
+description: "Trace one HTTP request through Nest core from the adapter to middleware, guards, interceptors, pipes, the handler, and the final response."
+---
+
+This page follows a single HTTP request through every internal handoff in the Nest core router. You will see the exact sequence of class invocations, how request-scoped instances are created, how exceptions are caught and forwarded to filters, and how 404s are handled. All class names and method signatures are taken from the source at commit `a3a31b96436a0c5fc33266a19c02cfa4fd2c03c0`.
+
+## Boot-time registration order
+
+The sequence in `NestApplication.init()` controls which layer sees the request first:
+
+```ts packages/core/nest-application.ts
+await this.registerModules();
+await this.registerRouter();
+await this.callInitHook();
+await this.registerRouterHooks();
+```
+
+`registerModules()` resolves every module and calls `MiddlewareModule.register`, which creates the `MiddlewareBuilder` and invokes each module's `configure` method. Inside `registerRouter`, middleware is bound to the adapter before controller routes are registered:
+
+```ts packages/core/nest-application.ts
+await this.registerMiddleware(this.httpAdapter);
+// ...
+this.routesResolver.resolve(this.httpAdapter, basePath);
+```
+
+After all routes are registered, `registerRouterHooks()` installs the catch-all handlers:
+
+```ts packages/core/nest-application.ts
+this.routesResolver.registerNotFoundHandler();
+this.routesResolver.registerExceptionHandler();
+```
+
+This means:
+
+1. If any middleware matches the URL, it runs first.
+2. If no route matches, the not-found handler throws `NotFoundException`.
+
+## Per-request flow overview
+
+Once the application is initialized, a request that hits a registered route follows this path:
+
+<Steps>
+  <Step title="RouterProxy catches the request">
+    The adapter calls the proxy returned by `RouterProxy.createProxy`. A `try/catch` wraps the entire downstream chain.
+  </Step>
+  <Step title="RouterExecutionContext handler runs">
+    The proxy delegates to the async function built by `RouterExecutionContext.create`. This function is `(req, res, next) => Promise<void>`.
+  </Step>
+  <Step title="Guards execute">
+    `fnCanActivate` calls `GuardsConsumer.tryActivate`. If any guard returns `false`, a `ForbiddenException` is thrown immediately.
+  </Step>
+  <Step title="Status and headers are set">
+    `RouterResponseController.setStatus` applies the default or `@HttpCode` status. Custom `@Header()` values are written if present.
+  </Step>
+  <Step title="SSE signal is attached (if needed)">
+    For `@Sse()` handlers, an `AbortController` is attached via `attachSseAbortSignal` before interceptors run.
+  </Step>
+  <Step title="Interceptors wrap the handler">
+    `InterceptorsConsumer.intercept` builds a nested RxJS chain. Each interceptor receives an `ExecutionContextHost` and a `CallHandler`.
+  </Step>
+  <Step title="Pipes transform parameters">
+    Inside the innermost interceptor callback, `fnApplyPipes` extracts values from `req`/`res`/`next` and runs them through the pipe chain in parallel.
+  </Step>
+  <Step title="Controller method is invoked">
+    The actual controller method is called with the transformed arguments.
+  </Step>
+  <Step title="Response is serialized">
+    `fnHandleResponse` delegates to `RouterResponseController` for JSON, redirect, render, or SSE.
+  </Step>
+</Steps>
+
+## Entry point: RouterProxy
+
+`RouterExplorer.applyCallbackToRouter` registers the handler on the adapter. For a statically-scoped controller, it calls `createCallbackProxy`:
+
+```ts packages/core/router/router-explorer.ts
+const executionContext = this.executionContextCreator.create(
+  instance,
+  callback,
+  methodName,
+  moduleRef,
+  requestMethod,
+);
+const exceptionFilter = this.exceptionsFilter.create(
+  instance,
+  callback,
+  moduleRef,
+  contextId,
+  inquirerId,
+);
+return this.routerProxy.createProxy(executionContext, exceptionFilter);
+```
+
+`RouterProxy.createProxy` returns a function that catches any downstream error and forwards it to `ExceptionsHandler.next`:
+
+```ts packages/core/router/router-proxy.ts
+public createProxy(
+  targetCallback: RouterProxyCallback,
+  exceptionsHandler: ExceptionsHandler,
+) {
+  return async <TRequest, TResponse>(
+    req: TRequest,
+    res: TResponse,
+    next: () => void,
+  ) => {
+    try {
+      await targetCallback(req, res, next);
+    } catch (e) {
+      const host = new ExecutionContextHost([req, res, next]);
+      exceptionsHandler.next(e, host);
+      return res;
+    }
+  };
+}
+```
+
+`ExceptionsHandler.next` first tries custom filters, then falls back to `BaseExceptionFilter.catch`.
+
+## RouterExecutionContext.create
+
+`RouterExecutionContext.create` is called once per controller method during discovery. It returns the function that the adapter calls on every request. The body is:
+
+```ts packages/core/router/router-execution-context.ts
+public create(
+  instance: Controller,
+  callback: (...args: any[]) => unknown,
+  methodName: string,
+  moduleKey: string,
+  requestMethod: RequestMethod,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+) {
+  const contextType: ContextType = 'http';
+  const {
+    argsLength,
+    fnHandleResponse,
+    isSseHandler,
+    paramtypes,
+    getParamsMetadata,
+    httpStatusCode,
+    responseHeaders,
+    hasCustomHeaders,
+  } = this.getMetadata(instance, callback, methodName, moduleKey, requestMethod, contextType);
+
+  const paramsOptions = this.contextUtils.mergeParamsMetatypes(
+    getParamsMetadata(moduleKey, contextId, inquirerId),
+    paramtypes,
+  );
+  const pipes = this.pipesContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+  const guards = this.guardsContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+  const interceptors = this.interceptorsContextCreator.create(instance, callback, moduleKey, contextId, inquirerId);
+
+  const fnCanActivate = this.createGuardsFn(guards, instance, callback, contextType);
+  const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+
+  const handler =
+    <TRequest, TResponse>(args: any[], req: TRequest, res: TResponse, next: Function) =>
+    async () => {
+      fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+      return callback.apply(instance, args);
+    };
+
+  return async <TRequest, TResponse>(req: TRequest, res: TResponse, next: Function) => {
+    const args = this.contextUtils.createNullArray(argsLength);
+    fnCanActivate && (await fnCanActivate([req, res, next]));
+
+    this.responseController.setStatus(res, httpStatusCode);
+    hasCustomHeaders && this.responseController.setHeaders(res, responseHeaders);
+
+    if (isSseHandler) {
+      this.attachSseAbortSignal(req);
+    }
+
+    const resultOrDeferred = this.interceptorsConsumer.intercept(
+      interceptors, [req, res, next], instance, callback,
+      handler(args, req, res, next), contextType,
+    );
+    const result = isSseHandler ? resultOrDeferred : await resultOrDeferred;
+    await (fnHandleResponse as HandlerResponseBasicFn)(result, res, req);
+  };
+}
+```
+
+### Exact per-request ordering
+
+Reading the returned function from top to bottom:
+
+1. `args = createNullArray(argsLength)`
+2. `fnCanActivate([req, res, next])` (guards)
+3. `setStatus(res, httpStatusCode)`
+4. `setHeaders(res, responseHeaders)` (if `hasCustomHeaders`)
+5. `attachSseAbortSignal(req)` (if SSE)
+6. `interceptorsConsumer.intercept(..., handler(args, req, res, next), ...)`
+7. Inside the interceptor chain, `handler` eventually:
+   - calls `fnApplyPipes(args, req, res, next)` (pipes run in parallel via `Promise.all`)
+   - calls `callback.apply(instance, args)` (the controller method)
+8. `await resultOrDeferred` (or pass through for SSE)
+9. `fnHandleResponse(result, res, req)` (JSON / redirect / render / SSE)
+
+<Note>
+  Pipes run **inside** the interceptors chain, not before it. The interceptor `CallHandler.handle()` eventually invokes the inner function that applies pipes and calls the controller.
+</Note>
+
+## Guards: GuardsConsumer.tryActivate
+
+`createGuardsFn` builds an async function that delegates to `GuardsConsumer.tryActivate`:
+
+```ts packages/core/router/router-execution-context.ts
+public createGuardsFn<TContext extends string = ContextType>(
+  guards: CanActivate[],
+  instance: Controller,
+  callback: (...args: any[]) => any,
+  contextType?: TContext,
+): ((args: any[]) => Promise<void>) | null {
+  const canActivateFn = async (args: any[]) => {
+    const canActivate = await this.guardsConsumer.tryActivate<TContext>(
+      guards, args, instance, callback, contextType,
+    );
+    if (!canActivate) {
+      throw new ForbiddenException(FORBIDDEN_MESSAGE);
+    }
+  };
+  return guards.length ? canActivateFn : null;
+}
+```
+
+`GuardsConsumer.tryActivate` creates an `ExecutionContextHost`, then iterates guards in order:
+
+```ts packages/core/guards/guards-consumer.ts
+for (const guard of guards) {
+  const result = guard.canActivate(context);
+  if (typeof result === 'boolean') {
+    if (!result) return false;
+    continue;
+  }
+  if (await this.pickResult(result)) continue;
+  return false;
+}
+return true;
+```
+
+If any guard rejects, `ForbiddenException` is thrown and caught by `RouterProxy`, which forwards it to `ExceptionsHandler`.
+
+## Interceptors: InterceptorsConsumer.intercept
+
+The interceptor chain is built by `InterceptorsConsumer.intercept`:
+
+```ts packages/core/interceptors/interceptors-consumer.ts
+public async intercept<TContext extends string = ContextType>(
+  interceptors: NestInterceptor[],
+  args: unknown[],
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  next: () => Promise<unknown>,
+  type?: TContext,
+): Promise<unknown> {
+  if (!interceptors || isEmptyArray(interceptors)) {
+    return next();
+  }
+  const context = this.createContext(args, instance, callback);
+  context.setType<TContext>(type!);
+
+  const nextFn = async (i = 0) => {
+    if (i >= interceptors.length) {
+      return defer(AsyncResource.bind(() => this.transformDeferred(next)));
+    }
+    const handler: CallHandler = {
+      handle: () => defer(AsyncResource.bind(() => nextFn(i + 1))).pipe(mergeAll()),
+    };
+    return interceptors[i].intercept(context, handler);
+  };
+  return defer(() => nextFn()).pipe(mergeAll());
+}
+```
+
+Each interceptor receives `context` (an `ExecutionContextHost`) and `handler` (a `CallHandler`). Calling `handler.handle()` moves to the next interceptor. The innermost `next()` is the function returned by `RouterExecutionContext.create`'s `handler` closure, which runs pipes and the controller method.
+
+### transformDeferred and async context preservation
+
+`transformDeferred` eagerly calls `next()` inside `AsyncResource.bind` so that `AsyncLocalStorage` context is preserved through the RxJS chain:
+
+```ts packages/core/interceptors/interceptors-consumer.ts
+public transformDeferred(next: () => Promise<any>): Observable<any> {
+  const nextPromise = next();
+  return new Observable(subscriber => {
+    let innerSub: { unsubscribe(): void } | undefined;
+    nextPromise
+      .then(res => {
+        if (subscriber.closed) return;
+        const isDeferred = res instanceof Promise || res instanceof Observable;
+        innerSub = from(isDeferred ? res : Promise.resolve(res)).subscribe(subscriber);
+      })
+      .catch(err => {
+        if (!subscriber.closed) subscriber.error(err);
+      });
+    return () => { innerSub?.unsubscribe(); };
+  });
+}
+```
+
+## Pipes: createPipesFn
+
+Inside the interceptor chain, `fnApplyPipes` is called. It resolves every parameter in parallel:
+
+```ts packages/core/router/router-execution-context.ts
+public createPipesFn(
+  pipes: PipeTransform[],
+  paramsOptions: (ParamProperties & { metatype?: any })[],
+) {
+  const pipesFn = async <TRequest, TResponse>(
+    args: any[], req: TRequest, res: TResponse, next: Function,
+  ) => {
+    const resolveParamValue = async (param) => {
+      const { index, extractValue, type, data, metatype, pipes: paramPipes, schema } = param;
+      const value = extractValue(req, res, next);
+      args[index] = this.isPipeable(type)
+        ? await this.getParamValue(value, { metatype, type, data, schema }, pipes.concat(paramPipes))
+        : value;
+    };
+    await Promise.all(paramsOptions.map(resolveParamValue));
+  };
+  return paramsOptions.length ? pipesFn : null;
+}
+```
+
+`isPipeable` returns `true` for `BODY`, `RAW_BODY`, `QUERY`, `PARAM`, `FILE`, `FILES`, and custom decorators (string keys). `REQUEST`, `RESPONSE`, `NEXT`, and `HEADERS` skip the pipe chain.
+
+### Parameter extraction at pipe time
+
+`extractValue` comes from either `RouteParamsFactory.exchangeKeyForValue` or a custom decorator factory. It reads the request at pipe time, not at guard time. So a guard that inspects `req.params` sees raw values; pipes transform them before the controller receives them.
+
+## Response handling
+
+`createHandleResponseFn` selects the strategy based on decorator metadata:
+
+| Decorator | Response function |
+| --- | --- |
+| `@Render()` | `responseController.render(result, res, template)` |
+| `@Redirect()` with `url` | `responseController.redirect(result, res, redirectResponse)` |
+| `@Sse()` | `responseController.sse(result, rawResponse, req, options)` |
+| none | `responseController.apply(result, res, httpStatusCode)` |
+
+For regular JSON, `apply` delegates to `applicationRef.reply`:
+
+```ts packages/core/router/router-response-controller.ts
+public async apply<TInput = any, TResponse = any>(
+  result: TInput, response: TResponse, httpStatusCode?: number,
+) {
+  return this.applicationRef.reply(response, result, httpStatusCode);
+}
+```
+
+## Request-scoped controllers and providers
+
+When a controller is not statically scoped (`!instanceWrapper.isDependencyTreeStatic()`), `RouterExplorer` creates a per-request handler instead of caching a proxy at boot time:
+
+```ts packages/core/router/router-explorer.ts
+public createRequestScopedHandler(
+  instanceWrapper: InstanceWrapper,
+  requestMethod: RequestMethod,
+  moduleRef: Module,
+  moduleKey: string,
+  methodName: string,
+) {
+  // ...
+  return async (req, res, next) => {
+    try {
+      const contextId = this.getContextId(req, isTreeDurable);
+      const contextInstance = await this.injector.loadPerContext(
+        instance, moduleRef, collection, contextId,
+      );
+      await this.createCallbackProxy(
+        contextInstance,
+        contextInstance[methodName],
+        methodName,
+        moduleKey,
+        requestMethod,
+        contextId,
+        instanceWrapper.id,
+      )(req, res, next);
+    } catch (err) {
+      let exceptionFilter = this.exceptionFiltersCache.get(
+        instance[methodName],
+      );
+      if (!exceptionFilter) {
+        exceptionFilter = this.exceptionsFilter.create(
+          instance,
+          instance[methodName],
+          moduleKey,
+        );
+        this.exceptionFiltersCache.set(instance[methodName], exceptionFilter);
+      }
+      const host = new ExecutionContextHost([req, res, next]);
+      exceptionFilter.next(err, host);
+    }
+  };
+}
+```
+
+`getContextId` generates or reuses a `ContextId` tied to the request object:
+
+```ts packages/core/router/router-explorer.ts
+private getContextId(request: T, isTreeDurable: boolean): ContextId {
+  const contextId = ContextIdFactory.getByRequest(request);
+  if (!request[REQUEST_CONTEXT_ID]) {
+    Object.defineProperty(request, REQUEST_CONTEXT_ID, {
+      value: contextId, enumerable: false, writable: false, configurable: false,
+    });
+    const requestProviderValue = isTreeDurable
+      ? contextId.payload
+      : Object.assign(request, contextId.payload);
+    this.container.registerRequestProvider(requestProviderValue, contextId);
+  }
+  return contextId;
+}
+```
+
+This context ID is the key that `Injector.loadPerContext` uses to resolve request-scoped providers. The `REQUEST` provider is populated with the actual request object (or a durable subtree payload) and registered on the container for the lifetime of that context.
+
+## 404 handling
+
+After all controller routes are registered, `RoutesResolver.registerNotFoundHandler` installs a catch-all:
+
+```ts packages/core/router/routes-resolver.ts
+public registerNotFoundHandler() {
+  const applicationRef = this.container.getHttpAdapterRef();
+  const callback = <TRequest, TResponse>(req: TRequest, res: TResponse) => {
+    const method = applicationRef.getRequestMethod(req);
+    const url = applicationRef.getRequestUrl(req);
+    throw new NotFoundException(`Cannot ${method} ${url}`);
+  };
+  const handler = this.routerExceptionsFilter.create({}, callback, undefined);
+  const proxy = this.routerProxy.createProxy(callback, handler);
+  const prefix = this.applicationConfig.getGlobalPrefix();
+  applicationRef.setNotFoundHandler &&
+    applicationRef.setNotFoundHandler(proxy, prefix);
+}
+```
+
+If no earlier middleware or route matches, the adapter calls this proxy. It throws `NotFoundException`, which is caught by `RouterProxy` and forwarded to the `ExceptionsHandler` chain, so custom exception filters can transform it.
+
+## Error path
+
+Any exception thrown during guards, interceptors, pipes, or the controller method is caught by the outer `RouterProxy.createProxy` try/catch. The proxy creates an `ExecutionContextHost` and calls `exceptionsHandler.next(e, host)`. `ExceptionsHandler` first tries custom filters, then falls back to `BaseExceptionFilter.catch`, which sends the response through the adapter.
+
+For request-scoped controllers, if `loadPerContext` or `createCallbackProxy` throws, the error is caught in `createRequestScopedHandler` and forwarded to a cached `ExceptionsHandler`.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/nest-application.ts` | Boot sequence: `init()`, `registerRouter()`, `registerRouterHooks()` |
+| `packages/core/router/routes-resolver.ts` | Scans modules, delegates to `RouterExplorer`, installs not-found handler |
+| `packages/core/router/router-explorer.ts` | Discovers methods, decides static vs request-scoped, builds proxies |
+| `packages/core/router/router-proxy.ts` | Wraps every handler in try/catch + exception-filter forwarding |
+| `packages/core/router/router-execution-context.ts` | Composes guards, pipes, interceptors, and response handling per method |
+| `packages/core/guards/guards-consumer.ts` | Iterates guards and resolves booleans, Promises, and Observables |
+| `packages/core/interceptors/interceptors-consumer.ts` | Builds nested RxJS chain around the handler |
+| `packages/core/pipes/pipes-consumer.ts` | Applies pipe transforms sequentially |
+| `packages/core/router/router-response-controller.ts` | Serializes JSON, redirects, renders, and SSE streams |
+| `packages/core/router/router-exception-filters.ts` | Collects global and local exception filters per route |
+| `packages/core/exceptions/exceptions-handler.ts` | Chooses custom filter or falls back to `BaseExceptionFilter` |
+| `packages/core/helpers/context-id-factory.ts` | Generates per-request `ContextId` objects |
+| `packages/core/router/request/request-constants.ts` | `REQUEST_CONTEXT_ID` symbol |
+
+## Related pages
+
+- [Routing](/http/routing) : how routes are discovered and registered
+- [Execution Context](/http/execution-context) : metadata caching, parameter extraction, and `ExecutionContextHost`
+- [Middleware](/http/middleware) : how middleware is bound before routes
+- [Guards](/http/guards) : guard composition and ordering
+- [Interceptors](/http/interceptors) : interceptor context and chaining
+- [Pipes](/http/pipes) : pipe application per parameter
+- [Exception Filters](/http/exception-filters) : filter resolution and fallback

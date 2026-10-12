@@ -1,0 +1,459 @@
+---
+title: "Express Adapter Platform Internals and File Uploads"
+sidebarTitle: "Express Platform"
+description: "How ExpressAdapter maps Nest's adapter contract onto Express: replies, middleware, body parsers, versioning, and the multer file upload interceptors."
+---
+
+The Express platform is the default HTTP transport in Nest. When you call `NestFactory.create` without passing an explicit adapter, `NestFactoryStatic.createHttpAdapter` loads `ExpressAdapter` from `@nestjs/platform-express`. This page explains how `ExpressAdapter` maps Nest's abstract adapter contract onto Express.js APIs, and how the platform exposes additional convenience features such as body-parser configuration, view engines, and file uploads through multer.
+
+## Creating an Express-backed application
+
+From the user's perspective, the default factory already selects Express:
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+
+const app = await NestFactory.create(AppModule);
+await app.listen(3000);
+```
+
+If you want to use the full `NestExpressApplication` interface, pass the type parameter:
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+
+const app = await NestFactory.create<NestExpressApplication>(AppModule);
+```
+
+## ExpressAdapter constructor and instance
+
+`ExpressAdapter` in `packages/platform-express/adapters/express-adapter.ts` extends `AbstractHttpAdapter<http.Server | https.Server>`. Its constructor creates an Express application if none is provided and installs a top-level middleware that fires request/response hooks:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+constructor(instance?: any) {
+  super(instance || express());
+  this.instance!.use((req, res, next) => {
+    if (this.onResponseHook) {
+      res.on('finish', () => {
+        void this.onResponseHook!.apply(this, [req, res]);
+      });
+    }
+    if (this.onRequestHook) {
+      void this.onRequestHook.apply(this, [req, res, next]);
+    } else {
+      next();
+    }
+  });
+}
+```
+
+Every request flows through this top-level middleware first so that `onRequestHook` and `onResponseHook` can be triggered. These hooks are used internally by the framework to track requests and responses.
+
+## Initializing the HTTP server
+
+`initHttpServer` decides between HTTP and HTTPS, tracks open connections when `forceCloseConnections` is enabled, and optionally returns 503 during shutdown:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public initHttpServer(options: NestApplicationOptions) {
+  const isHttpsEnabled = options && options.httpsOptions;
+  if (isHttpsEnabled) {
+    this.httpServer = https.createServer(options.httpsOptions!, this.getInstance());
+  } else {
+    this.httpServer = http.createServer(this.getInstance());
+  }
+
+  if (options?.return503OnClosing) {
+    this.instance.use((req: any, res: any, next: any) => {
+      if (this.isShuttingDown) {
+        res.set('Connection', 'close');
+        res.status(503).send('Service Unavailable');
+      } else {
+        next();
+      }
+    });
+  }
+
+  if (options?.forceCloseConnections) {
+    this.trackOpenConnections();
+  }
+}
+```
+
+`beforeClose()` and `close()` set the shutdown flag, destroy tracked sockets, and then close the underlying `httpServer`:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public beforeClose() {
+  this.isShuttingDown = true;
+}
+
+public close() {
+  this.isShuttingDown = true;
+  this.closeOpenConnections();
+  if (!this.httpServer) {
+    return undefined;
+  }
+  return new Promise(resolve => this.httpServer.close(resolve));
+}
+```
+
+## Reply, status, redirect, and render
+
+`ExpressAdapter.reply` is one of the most important methods because it is called after every route handler to send the result back to the client:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public reply(response: any, body: any, statusCode?: number) {
+  if (!isNil(statusCode)) {
+    response.status(statusCode);
+  }
+  if (isNil(body)) {
+    return response.send();
+  }
+  if (body instanceof StreamableFile) {
+    this.applyStreamHeaders(response, body);
+    const stream = body.getStream();
+    stream.once('error', err => {
+      body.errorHandler(err, response);
+    });
+    return stream
+      .pipe<Writable>(response)
+      .on('error', (err: Error) => body.errorLogger(err));
+  }
+  const responseContentType = response.getHeader('Content-Type');
+  if (
+    typeof responseContentType === 'string' &&
+    !responseContentType.startsWith('application/json') &&
+    body?.statusCode >= HttpStatus.BAD_REQUEST
+  ) {
+    this.logger.warn(
+      "Content-Type doesn't match Reply body, you might need a custom ExceptionFilter for non-JSON responses",
+    );
+    response.setHeader('Content-Type', 'application/json');
+  }
+  return isObject(body) ? response.json(body) : response.send(String(body));
+}
+```
+
+If the body is a `StreamableFile`, it streams the content directly. Otherwise, objects become JSON and primitives become strings.
+
+`status`, `end`, `render`, and `redirect` are thin wrappers around Express response methods:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public status(response: any, statusCode: number) {
+  return response.status(statusCode);
+}
+
+public end(response: any, message?: string) {
+  return response.end(message);
+}
+
+public render(response: any, view: string, options: any) {
+  return response.render(view, options);
+}
+
+public redirect(response: any, statusCode: number, url: string) {
+  return response.redirect(statusCode, url);
+}
+```
+
+## Error and not-found handlers
+
+`setErrorHandler` mounts the error handler both at the root and under an optional prefix router:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public setErrorHandler(handler: Function, prefix?: string) {
+  if (prefix) {
+    const router = express.Router();
+    router.use(handler as any);
+    this.use(prefix, router);
+  }
+  // Always mount the error handler at the root as well, so routes living
+  // outside the global prefix (e.g., "setGlobalPrefix" exclusions or
+  // root-mounted routes) still pass through the exception layer.
+  return this.use(handler);
+}
+```
+
+`setNotFoundHandler` handles prefixed and unprefixed 404 cases. For unprefixed apps, it also skips requests that belong to another app's prefix so that multi-app setups do not swallow each other's routes:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public setNotFoundHandler(handler: Function, prefix?: string) {
+  if (prefix) {
+    this.registeredPrefixes.add(prefix);
+    const router = express.Router();
+    router.all('*path', handler as any);
+    return this.use(prefix, router);
+  }
+  return this.use((req, res, next) => {
+    const path = req.originalUrl.split(/[?#]/)[0];
+    for (const registeredPrefix of this.registeredPrefixes) {
+      // Match on full path segments only, so a prefix of "/api" does not
+      // swallow unrelated paths such as "/apiary".
+      if (
+        path === registeredPrefix ||
+        path.startsWith(`${registeredPrefix}/`)
+      ) {
+        return next();
+      }
+    }
+    return (handler as any)(req, res, next);
+  });
+}
+```
+
+## Middleware and body parsing
+
+`createMiddlewareFactory` uses `RouterMethodFactory` to choose the correct Express method for a given `RequestMethod`, and it converts legacy Fastify-style route patterns with `LegacyRouteConverter`:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public createMiddlewareFactory(requestMethod: RequestMethod) {
+  return (path: string, callback: Function) => {
+    try {
+      const convertedPath = LegacyRouteConverter.tryConvert(path);
+      return this.routerMethodFactory
+        .get(this.instance, requestMethod)
+        .call(this.instance, convertedPath, callback);
+    } catch (e) {
+      if (e instanceof TypeError) {
+        LegacyRouteConverter.printError(path);
+      }
+      throw e;
+    }
+  };
+}
+```
+
+`registerParserMiddleware` adds `express.json()` and `express.urlencoded()` only if they have not already been applied:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+  const bodyParserJsonOptions = getBodyParserOptions('json', rawBody!);
+  const bodyParserUrlencodedOptions = getBodyParserOptions(
+    'urlencoded',
+    rawBody!,
+    { extended: true },
+  );
+
+  const parserMiddleware = {
+    jsonParser: express.json(bodyParserJsonOptions),
+    urlencodedParser: express.urlencoded(bodyParserUrlencodedOptions),
+  };
+  Object.keys(parserMiddleware)
+    .filter(parser => !this.isMiddlewareApplied(parser))
+    .forEach(parserKey => this.use(parserMiddleware[parserKey]));
+}
+```
+
+You can register additional parsers on demand with `useBodyParser`:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public useBodyParser<ParserType extends NestExpressBodyParserType>(
+  type: ParserType,
+  rawBody: boolean,
+  options?: NestExpressBodyParserOptionsFor<ParserType>,
+): this {
+  const parserOptions = getBodyParserOptions(type, rawBody, options);
+  const parser = express[type](parserOptions);
+  this.use(parser);
+  return this;
+}
+```
+
+## Static assets and view engine
+
+`useStaticAssets` wraps `express.static`. If a `prefix` is supplied, it mounts the static middleware under that prefix:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public useStaticAssets(path: string, options: ServeStaticOptions) {
+  if (options && options.prefix) {
+    return this.use(options.prefix, express.static(path, options));
+  }
+  return this.use(express.static(path, options));
+}
+```
+
+`setBaseViewsDir` and `setViewEngine` map to Express app settings:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public setBaseViewsDir(path: string | string[]) {
+  return this.set('views', path);
+}
+
+public setViewEngine(engine: string) {
+  return this.set('view engine', engine);
+}
+```
+
+## Versioning filter
+
+`applyVersionFilter` in `ExpressAdapter` handles all versioning strategies except URI versioning (which is path-based and handled by the router). For each request, the filter extracts the version from headers, media type, or a custom extractor, and either calls the handler or forwards to `next()` to let another versioned handler attempt the match:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public applyVersionFilter(
+  handler: Function,
+  version: VersionValue,
+  versioningOptions: VersioningOptions,
+): VersionedRoute {
+  const callNextHandler: VersionedRoute = (req, res, next) => {
+    if (!next) {
+      throw new InternalServerErrorException(
+        'HTTP adapter does not support filtering on version',
+      );
+    }
+    return next();
+  };
+
+  if (
+    version === VERSION_NEUTRAL ||
+    versioningOptions.type === VersioningType.URI
+  ) {
+    return (req, res, next) => handler(req, res, next);
+  }
+  // ... custom, media type, and header versioning branches
+}
+```
+
+## Exception mapping
+
+Express body-parser can throw `SyntaxError` on invalid JSON, and Express itself can throw `URIError` on malformed percent-encoded paths. `mapException` normalizes these to Nest `BadRequestException` instances:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+public mapException(error: unknown): unknown {
+  switch (true) {
+    case error instanceof SyntaxError || error instanceof URIError:
+      return new BadRequestException(error.message);
+    default:
+      return error;
+  }
+}
+```
+
+## NestExpressApplication interface
+
+`NestExpressApplication` in `packages/platform-express/interfaces/nest-express-application.interface.ts` extends `INestApplication` with Express-specific APIs that reach the adapter through the proxy described in [HTTP Adapters](/platforms/http-adapters):
+
+```ts packages/platform-express/interfaces/nest-express-application.interface.ts
+export interface NestExpressApplication<
+  TServer extends CoreHttpServer | CoreHttpsServer = CoreHttpServer,
+> extends INestApplication<TServer> {
+  getHttpAdapter(): HttpServer<Express.Request, Express.Response, Express>;
+  set(...args: any[]): this;
+  engine(...args: any[]): this;
+  enable(...args: any[]): this;
+  disable(...args: any[]): this;
+  useStaticAssets(path: string, options?: ServeStaticOptions): this;
+  useBodyParser<ParserType extends NestExpressBodyParserType>(
+    parser: ParserType,
+    options?: NestExpressBodyParserOptionsFor<ParserType>,
+  ): this;
+  setBaseViewsDir(path: string | string[]): this;
+  setViewEngine(engine: string): this;
+  setLocal(key: string, value: any): this;
+  enableCors(options?: CorsOptions | CorsOptionsDelegate<any>): void;
+}
+```
+
+Methods like `set`, `enable`, and `disable` are not defined on `NestApplication` itself, but because of the adapter proxy they are forwarded to `ExpressAdapter`, which in turn delegates to the Express application instance.
+
+## Multer and file uploads
+
+The Express platform bundles multer interceptors for handling `multipart/form-data`. `MulterModule` in `packages/platform-express/multer/multer.module.ts` is a dynamic module that registers global multer options:
+
+```ts packages/platform-express/multer/multer.module.ts
+@Module({})
+export class MulterModule {
+  static register(options: MulterModuleOptions = {}): DynamicModule {
+    return {
+      module: MulterModule,
+      providers: [
+        { provide: MULTER_MODULE_OPTIONS, useFactory: () => options },
+        { provide: MULTER_MODULE_ID, useValue: randomStringGenerator() },
+      ],
+      exports: [MULTER_MODULE_OPTIONS],
+    };
+  }
+
+  static registerAsync(options: MulterModuleAsyncOptions): DynamicModule { /* ... */ }
+}
+```
+
+Individual interceptors accept `localOptions` that override the module-level options. For example, `FileInterceptor` in `packages/platform-express/multer/interceptors/file.interceptor.ts`:
+
+```ts packages/platform-express/multer/interceptors/file.interceptor.ts
+export function FileInterceptor(fieldName: string, localOptions?: MulterOptions): Type<NestInterceptor> {
+  class MixinInterceptor implements NestInterceptor {
+    protected multer: MulterInstance;
+
+    constructor(
+      @Optional()
+      @Inject(MULTER_MODULE_OPTIONS)
+      options: MulterModuleOptions = {},
+    ) {
+      this.multer = (multer as any)({ ...options, ...localOptions });
+    }
+
+    async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
+      const ctx = context.switchToHttp();
+      await new Promise<void>((resolve, reject) =>
+        this.multer.single(fieldName)(ctx.getRequest(), ctx.getResponse(), (err: any) => {
+          if (err) {
+            const error = transformException(err);
+            return reject(error);
+          }
+          resolve();
+        }),
+      );
+      return next.handle();
+    }
+  }
+  const Interceptor = mixin(MixinInterceptor);
+  return Interceptor;
+}
+```
+
+The other interceptors follow the same pattern but call different multer APIs:
+
+| Interceptor | Multer API | Use case |
+| --- | --- | --- |
+| `FileInterceptor` | `single(fieldName)` | One file in a single field |
+| `FilesInterceptor` | `array(fieldName, maxCount)` | Multiple files in one field |
+| `FileFieldsInterceptor` | `fields(uploadFields)` | Multiple named fields, each with their own file limits |
+| `AnyFilesInterceptor` | `any()` | Accept any files regardless of field name |
+| `NoFilesInterceptor` | `none()` | Reject any file uploads |
+
+Usage in a controller:
+
+```ts
+import { Controller, Post, UseInterceptors, UploadedFile } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+
+@Controller('upload')
+export class UploadController {
+  @Post()
+  @UseInterceptors(FileInterceptor('file'))
+  uploadFile(@UploadedFile() file: Express.Multer.File) {
+    return { filename: file.filename };
+  }
+}
+```
+
+<Note>
+  Multer options such as `dest`, `storage`, `limits`, and `fileFilter` can be passed either to `MulterModule.register` for global defaults or directly to the interceptor factory for local overrides.
+</Note>
+
+## Source files
+
+| File | Role |
+| --- | --- |
+| `packages/platform-express/adapters/express-adapter.ts` | `ExpressAdapter` class |
+| `packages/platform-express/interfaces/nest-express-application.interface.ts` | `NestExpressApplication` interface |
+| `packages/platform-express/interfaces/nest-express-body-parser.interface.ts` | Body parser type definitions |
+| `packages/platform-express/multer/multer.module.ts` | `MulterModule` dynamic module |
+| `packages/platform-express/multer/interceptors/*.ts` | Multer interceptors for file uploads |
+| `packages/core/nest-factory.ts` | `NestFactoryStatic` adapter loading |
+
+## Related pages
+
+- [HTTP Adapters](/platforms/http-adapters) for the abstract contract and proxy mechanism
+- [Fastify Platform](/platforms/fastify) for the alternative platform adapter

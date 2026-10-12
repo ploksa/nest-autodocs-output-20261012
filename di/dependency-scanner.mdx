@@ -1,0 +1,329 @@
+---
+title: "Nest DependenciesScanner: Module Scanning and Metadata Reflection"
+description: "How DependenciesScanner traverses the module graph, reflects metadata for imports, providers, controllers, and exports, and registers APP_* global enhancers."
+sidebarTitle: "Dependency Scanner"
+---
+
+After `NestContainer` is initialized, the framework must turn your decorated module classes into a fully populated graph. That work is performed by `DependenciesScanner` in `packages/core/scanner.ts`. It traverses the `imports` tree recursively, reflects `@Module()` metadata, registers providers and controllers, attaches enhancer metadata, calculates module distances, and wires global modules into every module.
+
+This page explains the scanning pipeline from the root module down through every leaf, how dynamic modules and `forwardRef` are handled, how `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, and `APP_FILTER` are intercepted and promoted to global scope, and how the `TopologyTree` is used to order modules for lifecycle hooks.
+
+## The entry point: `scan`
+
+`DependenciesScanner.scan` is called from the bootstrap logic with the root module class. It runs in six phases:
+
+<Steps>
+  <Step title="Register the core module">
+    `registerCoreModule` creates the `InternalCoreModule` (see [Modules and Container](/di/modules-and-container)) via `InternalCoreModuleFactory.create` and scans it first so that framework providers are available before user modules.
+  </Step>
+  <Step title="Scan for modules">
+    `scanForModules` starts at the root module and recursively follows every `imports` array, calling `container.addModule` for each metatype.
+  </Step>
+  <Step title="Scan module dependencies">
+    `scanModulesForDependencies` iterates every registered module and reflects providers, controllers, imports, and exports from `@Module()` metadata.
+  </Step>
+  <Step title="Attach scoped enhancers">
+    `addScopedEnhancersMetadata` attaches request- and transient-scoped `APP_*` enhancers to every controller and entry provider in the application.
+  </Step>
+  <Step title="Calculate distances">
+    `calculateModulesDistance` builds an acyclic `TopologyTree` from the root module and assigns each `Module.distance` based on its depth in the tree.
+  </Step>
+  <Step title="Bind global scope">
+    `container.bindGlobalScope()` adds every global module as an import to every non-global module.
+  </Step>
+</Steps>
+
+```ts packages/core/scanner.ts
+public async scan(module: Type<any>, options?: { overrides?: ModuleOverride[] }) {
+  await this.registerCoreModule(options?.overrides);
+  await this.scanForModules({ moduleDefinition: module, overrides: options?.overrides });
+  await this.scanModulesForDependencies();
+  this.addScopedEnhancersMetadata();
+
+  // Modules distance calculation should be done after all modules are scanned
+  // but before global modules are registered (linked to all modules).
+  // Global modules have their distance set to MAX anyway.
+  this.calculateModulesDistance();
+
+  this.container.bindGlobalScope();
+}
+```
+
+## `scanForModules`: recursive graph traversal
+
+`scanForModules` is the heart of module discovery. It accepts a `ModulesScanParameters` object containing the `moduleDefinition`, an optional `scope` (the ancestor module path used for error messages), a `ctxRegistry` (to detect cycles), and optional `overrides` for testing.
+
+```ts packages/core/scanner.ts
+public async scanForModules({
+  moduleDefinition,
+  lazy,
+  scope = [],
+  ctxRegistry = [],
+  overrides = [],
+}: ModulesScanParameters): Promise<Module[]> {
+  const { moduleRef: moduleInstance, inserted: moduleInserted } =
+    (await this.insertOrOverrideModule(moduleDefinition, overrides, scope)) ?? {};
+
+  if (lazy && !moduleInserted && moduleInstance?.isInstantiated) {
+    return [];
+  }
+
+  moduleDefinition =
+    this.getOverrideModuleByModule(moduleDefinition, overrides)?.newModule ??
+    moduleDefinition;
+
+  moduleDefinition =
+    moduleDefinition instanceof Promise
+      ? await moduleDefinition
+      : moduleDefinition;
+
+  ctxRegistry.push(moduleDefinition);
+
+  if (this.isForwardReference(moduleDefinition)) {
+    moduleDefinition = (moduleDefinition as ForwardReference).forwardRef();
+  }
+
+  const modules = !this.isDynamicModule(
+    moduleDefinition as Type<any> | DynamicModule,
+  )
+    ? this.reflectMetadata(
+        MODULE_METADATA.IMPORTS,
+        moduleDefinition as Type<any>,
+      )
+    : [
+        ...this.reflectMetadata(
+          MODULE_METADATA.IMPORTS,
+          (moduleDefinition as DynamicModule).module,
+        ),
+        ...((moduleDefinition as DynamicModule).imports || []),
+      ];
+
+  let registeredModuleRefs: Module[] = [];
+  for (const [index, innerModule] of modules.entries()) {
+    // In case of a circular dependency (ES module system), JavaScript will resolve the type to `undefined`.
+    if (innerModule === undefined) {
+      throw new UndefinedModuleException(moduleDefinition, index, scope);
+    }
+    if (!innerModule) {
+      throw new InvalidModuleException(
+        moduleDefinition,
+        index,
+        scope,
+        innerModule,
+      );
+    }
+    if (ctxRegistry.includes(innerModule)) {
+      continue;
+    }
+    const moduleRefs = await this.scanForModules({
+      moduleDefinition: innerModule,
+      scope: ([] as Array<Type>).concat(scope, moduleDefinition as Type),
+      ctxRegistry,
+      overrides,
+      lazy,
+    });
+    registeredModuleRefs = registeredModuleRefs.concat(moduleRefs);
+  }
+
+  if (!moduleInstance) {
+    return registeredModuleRefs;
+  }
+
+  if (lazy) {
+    this.container.bindGlobalsToImports(moduleInstance);
+  }
+  return [moduleInstance].concat(registeredModuleRefs);
+}
+```
+
+Three protections in this method are worth noting:
+
+1. **`undefined` imports**: In ES module systems, circular dependencies can resolve to `undefined`. The scanner throws `UndefinedModuleException` with the exact scope and index so you know which import is broken.
+2. **`null` / invalid imports**: Throws `InvalidModuleException` for non-module values.
+3. **Cycle detection via `ctxRegistry`**: If an import is already in the registry, the branch is skipped. This prevents infinite recursion without preventing the same module from being imported by two different parents (which is a legal diamond import).
+
+After resolving the module definition, the scanner reflects `MODULE_METADATA.IMPORTS` from the class. If the definition is a `DynamicModule`, the `imports` array from the dynamic object is merged with the reflected imports of the underlying module class.
+
+### `insertModule`: validation before insertion
+
+Before `container.addModule` is called, `insertModule` validates that the value is not an injectable, controller, or exception filter. If it is, `InvalidClassModuleException` is thrown with the offending type and a descriptive message.
+
+```ts packages/core/scanner.ts
+public async insertModule(moduleDefinition: any, scope: Type<unknown>[]) {
+  const moduleToAdd = this.isForwardReference(moduleDefinition)
+    ? moduleDefinition.forwardRef()
+    : moduleDefinition;
+
+  if (this.isInjectable(moduleToAdd)) {
+    throw new InvalidClassModuleException(moduleDefinition, scope, 'provider');
+  }
+  if (this.isController(moduleToAdd)) {
+    throw new InvalidClassModuleException(moduleDefinition, scope, 'controller');
+  }
+  if (this.isExceptionFilter(moduleToAdd)) {
+    throw new InvalidClassModuleException(moduleDefinition, scope, 'filter');
+  }
+
+  return this.container.addModule(moduleToAdd, scope);
+}
+```
+
+## `scanModulesForDependencies`: reflecting metadata
+
+Once every module is registered in the container, `scanModulesForDependencies` walks the `ModulesContainer` and populates each `Module` with its contents. It calls four reflection methods in order:
+
+1. `reflectImports(metatype, token, name)`
+2. `reflectProviders(metatype, token)`
+3. `reflectControllers(metatype, token)`
+4. `reflectExports(metatype, token)`
+
+```ts packages/core/scanner.ts
+public async scanModulesForDependencies(
+  modules: Map<string, Module> = this.container.getModules(),
+) {
+  for (const [token, { metatype }] of modules) {
+    await this.reflectImports(metatype, token, metatype.name);
+    this.reflectProviders(metatype, token);
+    this.reflectControllers(metatype, token);
+    this.reflectExports(metatype, token);
+  }
+}
+```
+
+Each reflection helper reads both static metadata (from the class decorator) and dynamic metadata (stored in `NestContainer.dynamicModulesMetadata` during `addModule`). For example, `reflectProviders` merges `Reflect.getMetadata(MODULE_METADATA.PROVIDERS, module)` with `container.getDynamicMetadataByToken(token, MODULE_METADATA.PROVIDERS)`.
+
+After collecting the list, it iterates and calls `insertProvider`, which delegates to `container.addProvider`.
+
+### Dynamic metadata on classes and methods
+
+For every controller and provider, `reflectDynamicMetadata` is called. This reads `@UseGuards`, `@UseInterceptors`, `@UsePipes`, and `@Catch` decorators at both the class level and the method level, then inserts them as injectables on the host module.
+
+```ts packages/core/scanner.ts
+public reflectDynamicMetadata(cls: Type<Injectable>, token: string) {
+  if (!cls || !cls.prototype) {
+    return;
+  }
+  this.reflectInjectables(cls, token, GUARDS_METADATA);
+  this.reflectInjectables(cls, token, INTERCEPTORS_METADATA);
+  this.reflectInjectables(cls, token, EXCEPTION_FILTERS_METADATA);
+  this.reflectInjectables(cls, token, PIPES_METADATA);
+  this.reflectParamInjectables(cls, token, ROUTE_ARGS_METADATA);
+}
+```
+
+Class-level enhancers are attached to the host wrapper. Method-level enhancers are attached with a `methodKey` so that the runtime context creators can apply them only to the specific handler.
+
+## `APP_*` enhancers and `applicationProvidersApplyMap`
+
+The scanner has special handling for providers whose `provide` token is one of the global enhancer keys: `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, or `APP_FILTER`. These are not stored as normal providers. Instead, a UUID-suffixed internal token is generated, the provider is rewritten to use that token, and an entry is pushed to `applicationProvidersApplyMap`.
+
+```ts packages/core/scanner.ts
+public insertProvider(provider: Provider, token: string) {
+  const isCustomProvider = this.isCustomProvider(provider);
+  if (!isCustomProvider) {
+    return this.container.addProvider(provider, token);
+  }
+
+  const applyProvidersMap = this.getApplyProvidersMap();
+  const providersKeys = Object.keys(applyProvidersMap);
+  const type = provider.provide;
+
+  if (!providersKeys.includes(type as string)) {
+    return this.container.addProvider(provider as any, token);
+  }
+
+  const uuid = UuidFactory.get(type.toString());
+  const providerToken = `${type as string} (UUID: ${uuid})`;
+
+  let scope = (provider as ClassProvider | FactoryProvider).scope;
+  if (isNil(scope) && (provider as ClassProvider).useClass) {
+    scope = getClassScope((provider as ClassProvider).useClass);
+  }
+
+  this.applicationProvidersApplyMap.push({
+    type,
+    moduleKey: token,
+    providerKey: providerToken,
+    scope,
+  });
+
+  const newProvider = {
+    ...provider,
+    provide: providerToken,
+    scope,
+  } as Provider;
+
+  const enhancerSubtype =
+    ENHANCER_TOKEN_TO_SUBTYPE_MAP[
+      type as
+        | typeof APP_GUARD
+        | typeof APP_PIPE
+        | typeof APP_FILTER
+        | typeof APP_INTERCEPTOR
+    ];
+  const factoryOrClassProvider = newProvider as
+    | FactoryProvider
+    | ClassProvider;
+
+  if (this.isRequestOrTransient(factoryOrClassProvider.scope!)) {
+    return this.container.addInjectable(newProvider, token, enhancerSubtype);
+  }
+  this.container.addProvider(newProvider, token, enhancerSubtype);
+}
+```
+
+After scanning, `applyApplicationProviders` consumes this map. For singleton-scoped enhancers, the resolved instance is passed to `applicationConfig.addGlobalGuard` (or pipe, interceptor, filter). For request- or transient-scoped enhancers, the `InstanceWrapper` itself is passed to `applicationConfig.addGlobalRequestGuard`, so that the runtime pipeline can resolve a fresh instance per request.
+
+## Module distance and `TopologyTree`
+
+Nest runs lifecycle hooks (`onModuleInit`, `onApplicationBootstrap`) in module order, starting with the root module. `calculateModulesDistance` ensures that every module knows its depth in the dependency tree, which determines hook execution order.
+
+```ts packages/core/scanner.ts
+public calculateModulesDistance() {
+  const modulesGenerator = this.container.getModules().values();
+  // Skip "InternalCoreModule"
+  // The second element is the actual root module
+  modulesGenerator.next();
+
+  const rootModule = modulesGenerator.next().value!;
+  if (!rootModule) {
+    return;
+  }
+
+  // Convert modules to an acyclic connected graph
+  const tree = new TopologyTree(rootModule);
+  tree.walk((moduleRef, depth) => {
+    if (moduleRef.isGlobal) {
+      return;
+    }
+    moduleRef.distance = depth;
+  });
+}
+```
+
+`TopologyTree` in `packages/core/injector/topology-tree/topology-tree.ts` traverses `_imports` and builds a tree of `TreeNode<Module>`. If a module is reachable through multiple paths (a diamond import), the tree keeps the shallowest path by relinking deeper nodes to the closer parent.
+
+```ts packages/core/injector/topology-tree/topology-tree.ts
+export class TopologyTree {
+  private root: TreeNode<Module>;
+  private links: Map<Module, TreeNode<Module>> = new Map();
+
+  constructor(moduleRef: Module) {
+    this.root = new TreeNode<Module>({ value: moduleRef, parent: null });
+    this.links.set(moduleRef, this.root);
+    this.traverseAndMapToTree(this.root);
+  }
+}
+```
+
+Global modules are skipped because their distance is already `Number.MAX_VALUE`, ensuring they run first. The distance values are consumed later by the lifecycle hooks runner in `packages/core/nest-application.ts`.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/scanner.ts` | `DependenciesScanner`: main scanning orchestrator. |
+| `packages/core/injector/topology-tree/topology-tree.ts` | `TopologyTree`: acyclic depth-first tree for distance calculation. |
+| `packages/core/metadata-scanner.ts` | `MetadataScanner`: reflects method names from class prototypes. |
+| `packages/core/constants.ts` | `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER`, and enhancer subtype map. |
+| `packages/core/injector/container.ts` | `NestContainer.addModule`, `addProvider`, `addImport`, `bindGlobalScope`. |

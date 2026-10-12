@@ -1,20 +1,137 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "Nest Framework Internals: Architecture Guide for Engineers"
+description: "A source-grounded guide to Nest internals: bootstrap, module graph, dependency injection, request pipeline, platform adapters, transports, and testing."
+sidebarTitle: "Introduction"
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+This site documents the internal architecture of the Nest framework for engineers who are onboarding to the codebase or extending it with custom modules, adapters, or transports. Every page traces real classes and functions in the Nest monorepo (`packages/common`, `packages/core`, the platform packages, `packages/microservices`, `packages/websockets`, and `packages/testing`) and explains how they hand off to each other at boot time and at request time.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+## What this site covers
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+- **Boot path**: how `NestFactory` builds a `NestContainer`, scans the module graph, and instantiates providers and controllers.
+- **Dependency injection**: how `NestContainer`, `DependenciesScanner`, `InstanceLoader`, and `Injector` resolve providers, manage scopes, and support lazy loading.
+- **Request pipeline**: how an HTTP request travels from the adapter through middleware, routing, guards, interceptors, pipes, the handler, and exception filters.
+- **Platforms and transports**: how Nest abstracts HTTP servers (Express, Fastify) and adds WebSocket gateways and microservice transports.
+- **Testing and extensibility**: how `@nestjs/testing` mirrors the production boot path with overrides, and which extension points are public.
+
+## Architecture at a glance
+
+### Boot path
+
+<Steps>
+  <Step title="NestFactory.create">
+    You call `NestFactory.create(AppModule)`. `NestFactoryStatic` creates an `ApplicationConfig`, a `NestContainer`, and a `GraphInspector`, and selects the HTTP adapter (by default it loads `ExpressAdapter` from `@nestjs/platform-express`).
+  </Step>
+  <Step title="Initialize">
+    The private `initialize` method in `packages/core/nest-factory.ts` creates an `Injector`, an `InstanceLoader`, a `MetadataScanner`, and a `DependenciesScanner`.
+  </Step>
+  <Step title="Scan modules">
+    `DependenciesScanner.scan` registers the internal core module, walks every imported module recursively, and records providers, controllers, injectables, imports, and exports on the container.
+  </Step>
+  <Step title="Create instances">
+    `InstanceLoader.createInstancesOfDependencies` first creates prototypes, then instantiates providers, injectables, and controllers through the `Injector`.
+  </Step>
+  <Step title="Apply application providers">
+    `DependenciesScanner.applyApplicationProviders` binds global enhancers registered with `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, and `APP_FILTER` to the `ApplicationConfig`.
+  </Step>
+  <Step title="Init and listen">
+    `NestApplication.init` (called by `listen` if needed) registers middleware, then routes through `RoutesResolver` and `RouterExplorer`, and runs lifecycle hooks.
+  </Step>
+</Steps>
+
+```ts packages/core/nest-factory.ts
+await dependenciesScanner.scan(module);
+await instanceLoader.createInstancesOfDependencies();
+dependenciesScanner.applyApplicationProviders();
+```
+
+### Request pipeline
+
+<Steps>
+  <Step title="Adapter receives the request">
+    The underlying server (Express, Fastify, or a custom `AbstractHttpAdapter`) receives the request.
+  </Step>
+  <Step title="Middleware runs">
+    Middleware configured through `NestModule.configure` and `MiddlewareConsumer` is bound to the adapter by `MiddlewareModule` and runs before route handlers.
+  </Step>
+  <Step title="Router proxy">
+    The matched route callback is wrapped by `RouterProxy`, which forwards thrown errors to an `ExceptionsHandler`.
+  </Step>
+  <Step title="Guards">
+    `RouterExecutionContext` runs guards through `GuardsConsumer.tryActivate`. A falsy result throws `ForbiddenException`.
+  </Step>
+  <Step title="Interceptors">
+    `InterceptorsConsumer.intercept` chains interceptors around a deferred handler call.
+  </Step>
+  <Step title="Pipes and handler">
+    Inside that deferred call, pipes transform the route arguments, then the controller method runs.
+  </Step>
+  <Step title="Response or filters">
+    `RouterResponseController` writes the result. If anything throws, exception filters (custom or `BaseExceptionFilter`) produce the error response.
+  </Step>
+</Steps>
+
+<CardGroup cols={2}>
+  <Card title="Package Map" icon="box" href="/overview/package-map">
+    What each package provides and how they depend on each other.
+  </Card>
+
+  <Card title="Bootstrap" icon="power-off" href="/overview/bootstrap">
+    The initialization sequence from `NestFactory.create` to `listen`.
+  </Card>
+
+  <Card title="Modules and Container" icon="sitemap" href="/di/modules-and-container">
+    How `NestContainer` and `Module` hold the module graph.
+  </Card>
+
+  <Card title="Injector" icon="syringe" href="/di/injector">
+    Constructor and property resolution, `forwardRef`, and optional dependencies.
+  </Card>
+
+  <Card title="Request Lifecycle" icon="route" href="/http/request-lifecycle">
+    The end-to-end HTTP request path with every handoff.
+  </Card>
+
+  <Card title="HTTP Adapters" icon="plug" href="/platforms/http-adapters">
+    `AbstractHttpAdapter`, `HttpAdapterHost`, and adapter loading.
+  </Card>
+
+  <Card title="Testing" icon="flask" href="/extending/testing">
+    `Test.createTestingModule`, overrides, and mock fallbacks.
+  </Card>
+
+  <Card title="Extension Points" icon="puzzle-piece" href="/extending/extension-points">
+    Every public interface for customizing Nest.
+  </Card>
+</CardGroup>
+
+## Suggested reading order
+
+<Steps>
+  <Step title="Start at the boot path">
+    Read [Package Map](/overview/package-map), [Bootstrap](/overview/bootstrap), and [Lifecycle Hooks](/overview/lifecycle-hooks).
+  </Step>
+  <Step title="Learn the DI container">
+    Read [Modules and Container](/di/modules-and-container), [Dependency Scanner](/di/dependency-scanner), [Instance Loader](/di/instance-loader), [Injector](/di/injector), [Scopes and InstanceWrapper](/di/scopes-and-instance-wrapper), [ModuleRef and Lazy Loading](/di/module-ref-and-lazy-loading), and [Metadata and Reflection](/di/metadata-and-reflection).
+  </Step>
+  <Step title="Follow a request">
+    Read [Request Lifecycle](/http/request-lifecycle), then [Routing](/http/routing), [Execution Context](/http/execution-context), [Middleware](/http/middleware), [Guards](/http/guards), [Pipes](/http/pipes), [Interceptors](/http/interceptors), and [Exception Filters](/http/exception-filters).
+  </Step>
+  <Step title="Explore platforms, testing, and extension">
+    Read [HTTP Adapters](/platforms/http-adapters), [Express](/platforms/express), [Fastify](/platforms/fastify), [WebSockets](/platforms/websockets), [Microservices](/platforms/microservices), [Testing](/extending/testing), [Discovery and Inspector](/extending/discovery-and-inspector), and [Extension Points](/extending/extension-points).
+  </Step>
+</Steps>
+
+## Source files
+
+| Path | Responsibility |
+| --- | --- |
+| `packages/core/nest-factory.ts` | `NestFactoryStatic`, entry point for creating applications |
+| `packages/core/injector/container.ts` | `NestContainer`, holds the module graph |
+| `packages/core/scanner.ts` | `DependenciesScanner`, discovers modules and metadata |
+| `packages/core/injector/instance-loader.ts` | `InstanceLoader`, creates prototypes and instances |
+| `packages/core/injector/injector.ts` | `Injector`, resolves dependencies |
+| `packages/core/router/routes-resolver.ts` | `RoutesResolver`, registers controller routes |
+| `packages/core/router/router-execution-context.ts` | `RouterExecutionContext`, composes guards, interceptors, pipes, and the handler |
+| `packages/core/router/router-proxy.ts` | `RouterProxy`, wraps route callbacks with exception handling |
+| `packages/core/middleware/middleware-module.ts` | `MiddlewareModule`, binds middleware to the adapter |

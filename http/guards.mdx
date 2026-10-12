@@ -1,0 +1,399 @@
+---
+title: "Guard Execution Flow and Access Control in Nest"
+description: "How GuardsContextCreator resolves guard metadata and GuardsConsumer.tryActivate evaluates boolean, Promise, or Observable results before interceptors run."
+sidebarTitle: "Guards Execution"
+---
+
+Guards in Nest authorize or deny access to routes. They run before pipes transform parameters and before the route handler executes. If any guard returns `false`, the framework immediately throws a `ForbiddenException` and the request never reaches parameter parsing or the handler body. This page explains how `GuardsContextCreator` gathers guard instances, how `GuardsConsumer` evaluates them in series, and where they sit in the request pipeline.
+
+## The CanActivate Interface
+
+Every guard implements the `CanActivate` interface from `packages/common/interfaces/features/can-activate.interface.ts`:
+
+```ts packages/common/interfaces/features/can-activate.interface.ts
+export interface CanActivate {
+  canActivate(
+    context: ExecutionContext,
+  ): boolean | Promise<boolean> | Observable<boolean>;
+}
+```
+
+A guard receives an `ExecutionContext` and must return a truthy or falsy value synchronously (`boolean`), asynchronously (`Promise<boolean>`), or as a reactive stream (`Observable<boolean>`). A guard returning `true` allows the request to proceed; `false` results in a `ForbiddenException` thrown by `RouterExecutionContext`.
+
+## Registering Guards
+
+Guards are registered in three ways. Each defines an individual guard class or an array of guards, which `GuardsContextCreator` later collects in this priority order:
+
+```ts
+// 1. Controller or method
+@UseGuards(RolesGuard)
+class MyController {}
+
+// 2. Global
+app.useGlobalGuards(new GlobalGuard());
+
+// 3. In provider module through APP_GUARD
+{
+  provide: APP_GUARD,
+  useClass: GlobalRolesGuard,
+}
+```
+
+`APP_GUARD` is injected by dependency injection and may participate in per-request instantiation. Because of this, it has special treatment in metadata resolution compared to a static app-level guard.
+
+## Where Guards Run in the Request Pipeline
+
+`RouterExecutionContext.create` returns a proxy function that executes enhancers in a strict order. Looking at the proxy body in `packages/core/router/router-execution-context.ts`:
+
+```ts packages/core/router/router-execution-context.ts
+return async <TRequest, TResponse>(
+  req: TRequest,
+  res: TResponse,
+  next: Function,
+) => {
+  const args = this.contextUtils.createNullArray(argsLength);
+  fnCanActivate && (await fnCanActivate([req, res, next]));
+
+  // ... set status, headers, SSE abort controller ...
+
+  const resultOrDeferred = this.interceptorsConsumer.intercept(
+    interceptors,
+    [req, res, next],
+    instance,
+    callback,
+    handler(args, req, res, next),
+    contextType,
+  );
+  // ...
+};
+```
+
+The `handler` function itself applies pipes before running the route handler:
+
+```ts packages/core/router/router-execution-context.ts
+const handler =
+  <TRequest, TResponse>(
+    args: any[],
+    req: TRequest,
+    res: TResponse,
+    next: Function,
+  ) =>
+  async () => {
+    fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+    return callback.apply(instance, args);
+  };
+```
+
+This means the runtime order is:
+
+1. Guards (`fnCanActivate`)
+2. Interceptors (outer `intercept` call wrapping the handler)
+3. Pipes (`fnApplyPipes` inside the handler)
+4. Route handler (`callback.apply(instance, args)`)
+
+<Note>
+  Guards run before parameter transformation. A guard that rejects access prevents any pipe from executing, so validation or parsing costs are never incurred for unauthorized requests.
+</Note>
+
+## How Guards Are Gathered
+
+`GuardsContextCreator` lives in `packages/core/guards/guards-context-creator.ts` and is responsible for turning decorated metadata into a flat, ordered array of guard instances. It extends the base `ContextCreator` class.
+
+### Creating the Guard Context
+
+The entry point is `GuardsContextCreator.create`, which returns `CanActivate[]` in the appropriate instantiation strategy for metadata-level and instance-level guards:
+
+```ts packages/core/guards/guards-context-creator.ts
+public create(
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  module: string,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): CanActivate[] {
+  this.moduleContext = module;
+  return this.createContext(
+    instance,
+    callback,
+    GUARDS_METADATA,
+    contextId,
+    inquirerId,
+  );
+}
+```
+
+`createContext` is inherited from `ContextCreator`. It aggregates metadata in this order:
+
+- Global guards
+- Controller-level guards
+- Method-level guards
+
+Each group is processed by `createConcreteContext`. For `APP_GUARD` providers, `getGlobalMetadata` includes scoped guards alongside the global metadata resolved by `getGlobalGuards()`:
+
+```ts packages/core/guards/guards-context-creator.ts
+public getGlobalMetadata<T extends unknown[]>(
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): T {
+  if (!this.config) {
+    return [] as unknown[] as T;
+  }
+  const globalGuards = this.config.getGlobalGuards() as T;
+  if (contextId === STATIC_CONTEXT && !inquirerId) {
+    return globalGuards;
+  }
+  const scopedGuardWrappers =
+    this.config.getGlobalRequestGuards();
+  const scopedGuards = iterate(scopedGuardWrappers)
+    .map(wrapper =>
+      wrapper.getInstanceByContextId(
+        this.getContextId(contextId, wrapper),
+        inquirerId,
+      ),
+    )
+    .filter(host => !!host)
+    .map(host => host.instance)
+    .toArray();
+  return globalGuards.concat(scopedGuards) as T;
+}
+```
+
+This ensures that request-scoped `APP_GUARD` providers are always instantiated in the same request scope as the handler they protect.
+
+### Resolving Guard Instances
+
+`createConcreteContext` transforms metadata entries (classes, instances, or references) into concrete guard instances by calling `getGuardInstance` for each entry, and then filters the result for valid guards:
+
+```ts packages/core/guards/guards-context-creator.ts
+public createConcreteContext<T extends unknown[], R extends unknown[]>(
+  metadata: T,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): R {
+  if (isEmpty(metadata)) {
+    return [] as unknown[] as R;
+  }
+  return iterate(metadata)
+    .filter((guard: any) => guard && (guard.name || guard.canActivate))
+    .map(guard =>
+      this.getGuardInstance(guard as Function, contextId, inquirerId),
+    )
+    .filter(
+      (guard: CanActivate | null) =>
+        !!guard && isFunction(guard.canActivate),
+    )
+    .toArray() as R;
+}
+```
+
+`getGuardInstance` prefers an existing object with a `canActivate` method and otherwise resolves and instantiates the class from the module's injectable collection:
+
+```ts packages/core/guards/guards-context-creator.ts
+public getGuardInstance(
+  metatype: Function | CanActivate,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): CanActivate | null {
+  const isObject = !!(metatype as CanActivate).canActivate;
+  if (isObject) {
+    return metatype as CanActivate;
+  }
+  const instanceWrapper = this.getInstanceByMetatype(metatype as Type<unknown>);
+  if (!instanceWrapper) {
+    return null;
+  }
+  const instanceHost = instanceWrapper.getInstanceByContextId(
+    this.getContextId(contextId, instanceWrapper),
+    inquirerId,
+  );
+  return instanceHost && instanceHost.instance;
+}
+```
+
+Guards that are not found in the module are silently excluded. The end result is a flat `CanActivate[]` ready for evaluation.
+
+## How Guards Are Evaluated
+
+Once the guard array is built, `RouterExecutionContext.createGuardsFn` builds a function that runs the guards before calling the handler. That function delegates the actual evaluation to `GuardsConsumer`:
+
+```ts packages/core/router/router-execution-context.ts
+public createGuardsFn<TContext extends string = ContextType>(
+  guards: CanActivate[],
+  instance: Controller,
+  callback: (...args: any[]) => any,
+  contextType?: TContext,
+): ((args: any[]) => Promise<void>) | null {
+  const canActivateFn = async (args: any[]) => {
+    const canActivate = await this.guardsConsumer.tryActivate<TContext>(
+      guards,
+      args,
+      instance,
+      callback,
+      contextType,
+    );
+    if (!canActivate) {
+      throw new ForbiddenException(FORBIDDEN_MESSAGE);
+    }
+  };
+  return guards.length ? canActivateFn : null;
+}
+```
+
+When no guards are present for a route, `createGuardsFn` returns `null` so there is no guard overhead on unprotected handlers.
+
+### The Consumer Loop
+
+`GuardsConsumer.tryActivate` evaluates guards in series until a guard returns `false` or an exception rejects access. The function creates an `ExecutionContextHost` from the current request args, controller constructor, and handler function, then iterates guards using a simple `for...of` loop calling each guard's `canActivate`:
+
+```ts packages/core/guards/guards-consumer.ts
+export class GuardsConsumer {
+  public async tryActivate<TContext extends string = ContextType>(
+    guards: CanActivate[],
+    args: unknown[],
+    instance: Controller,
+    callback: (...args: unknown[]) => unknown,
+    type?: TContext,
+  ): Promise<boolean> {
+    if (!guards || isEmptyArray(guards)) {
+      return true;
+    }
+    const context = this.createContext(args, instance, callback);
+    context.setType<TContext>(type!);
+
+    for (const guard of guards) {
+      const result = guard.canActivate(context);
+      if (typeof result === 'boolean') {
+        if (!result) {
+          return false;
+        }
+        continue;
+      }
+      if (await this.pickResult(result)) {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+}
+```
+
+Each guard receives the same `ExecutionContextHost` so it can inspect the route and request data. The loop delegates the asynchronous handling to `pickResult`:
+
+```ts packages/core/guards/guards-consumer.ts
+public async pickResult(
+  result: boolean | Promise<boolean> | Observable<boolean>,
+): Promise<boolean> {
+  if (result instanceof Observable) {
+    return lastValueFrom(result);
+  }
+  return result;
+}
+```
+
+`pickResult` normalizes RxJS `Observable<boolean>` by turning it into a `Promise<boolean>` with `lastValueFrom`, and returns a `Promise<boolean>` or a synchronous boolean unchanged.
+
+### Forbidden Path
+
+When `tryActivate` returns `false`, `RouterExecutionContext` throws a `ForbiddenException` with the literal `FORBIDDEN_MESSAGE`:
+
+```ts packages/core/guards/constants.ts
+export const FORBIDDEN_MESSAGE = 'Forbidden resource';
+```
+
+This exception is then caught by the exception filter chain and converted into a `403 Forbidden` HTTP response.
+
+## ContextCreator Base Behavior
+
+The `createContext` method from the shared `ContextCreator` base merges metadata in a specific order for guards, pipes, interceptors, and filters. For guards, it merges the metadata in this priority:
+
+```ts packages/core/helpers/context-creator.ts
+public createContext(
+  instance: Controller,
+  callback: (...args: any[]) => void,
+  metadataKey: string,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): R {
+  const globalMetadata =
+    this.getGlobalMetadata &&
+    this.getGlobalMetadata<T>(contextId, inquirerId);
+  const classMetadata = this.reflectClassMetadata<T>(instance, metadataKey);
+  const methodMetadata = this.reflectMethodMetadata<T>(callback, metadataKey);
+  return [
+    ...this.createConcreteContext<T, R>(
+      globalMetadata || ([] as unknown[] as T),
+      contextId,
+      inquirerId,
+    ),
+    ...this.createConcreteContext<T, R>(classMetadata, contextId, inquirerId),
+    ...this.createConcreteContext<T, R>(
+      methodMetadata,
+      contextId,
+      inquirerId,
+    ),
+  ] as R;
+}
+```
+
+Because metadata is flattened in global, class, method order, method-level guards are evaluated last and can override or augment global behavior even when preceding guards have already passed.
+
+## Example: A Role-Based Guard
+
+The following guard checks a `roles` property on `ExecutionContext` using the `Reflector` from metadata and either returns `true` or `false`:
+
+```ts
+import { CanActivate, ExecutionContext, Injectable, SetMetadata } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const roles = this.reflector.get<string[]>('roles', context.getHandler());
+    if (!roles) {
+      return true;
+    }
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
+    return roles.some(role => user.roles?.includes(role));
+  }
+}
+```
+
+Usage:
+
+```ts
+@Controller('items')
+@UseGuards(RolesGuard)
+export class ItemsController {
+  @Post()
+  @SetMetadata('roles', ['admin'])
+  create() {
+    return 'created';
+  }
+}
+```
+
+When a `POST /items` request arrives, `GuardsContextCreator` resolves the `RolesGuard` from dependency injection, `GuardsConsumer` creates an `ExecutionContextHost`, calls `canActivate`, and on `false` throws `ForbiddenException`.
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/core/guards/guards-context-creator.ts` | Gathers guard metadata and resolves guard instances from the DI container. |
+| `packages/core/guards/guards-consumer.ts` | Evaluates guards in series, normalizing `boolean`, `Promise`, and `Observable` results. |
+| `packages/core/guards/constants.ts` | Defines the literal `FORBIDDEN_MESSAGE` used when access is denied. |
+| `packages/core/router/router-execution-context.ts` | Orchestrates guard, pipe, interceptor, and handler setup in the proxy function. |
+| `packages/core/helpers/context-creator.ts` | Shared base class that merges metadata in global, class, method order. |
+| `packages/common/interfaces/features/can-activate.interface.ts` | Defines the `CanActivate` interface contract. |
+| `packages/common/decorators/core/use-guards.decorator.ts` | The `@UseGuards` decorator that stores guard metadata on classes and methods. |
+| `packages/common/exceptions/forbidden.exception.ts` | The `ForbiddenException` thrown when a guard returns `false`. |
+
+## See Also
+
+- [Pipes](/http/pipes) for parameter transformation and validation
+- [Interceptors](/http/interceptors) for wrapping the handler in an Observable chain
+- [Exception Filters](/http/exception-filters) for how `ForbiddenException` is converted to a response
+- [Execution Context](/http/execution-context) for the context object passed to each guard

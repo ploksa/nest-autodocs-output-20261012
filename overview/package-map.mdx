@@ -1,0 +1,144 @@
+---
+title: "Nest Framework Package Map and Dependency Guide"
+sidebarTitle: "Package Map"
+description: "Map of all NestJS packages, their public surface area, core directory structure, and dependency direction so you know where to start reading for each subsystem."
+---
+
+The NestJS framework is split across ten published packages under `packages/`. Each package has a specific role, and together they form a layered architecture: `@nestjs/common` provides shared contracts and decorators, `@nestjs/core` builds the DI container and request pipeline, platform packages adapt HTTP servers, and transport packages extend the framework to WebSockets and microservices. This page maps every package, lists its key directories, shows dependency direction, and tells you where to start reading for each subsystem.
+
+## Package overview
+
+| Package | Role | Peer deps on other NestJS packages |
+| --- | --- | --- |
+| `@nestjs/common` | Decorators, contracts, exceptions, pipes, utilities | None |
+| `@nestjs/core` | DI container, scanner, router, execution context, middleware, guards, interceptors, filters | `@nestjs/common` (required), `@nestjs/platform-express` (optional), `@nestjs/microservices` (optional), `@nestjs/websockets` (optional) |
+| `@nestjs/platform-express` | Express adapter and middleware bridge | `@nestjs/common`, `@nestjs/core` |
+| `@nestjs/platform-fastify` | Fastify adapter and middleware bridge | `@nestjs/common`, `@nestjs/core` |
+| `@nestjs/platform-socket.io` | Socket.IO adapter (used by `@nestjs/websockets`) | `@nestjs/common`, `@nestjs/websockets` |
+| `@nestjs/platform-ws` | Native WebSocket adapter (used by `@nestjs/websockets`) | `@nestjs/common`, `@nestjs/websockets` |
+| `@nestjs/websockets` | WebSocket gateway framework, decorators, and exception handling | `@nestjs/common`, `@nestjs/core`, `@nestjs/platform-socket.io` (optional) |
+| `@nestjs/microservices` | Microservice framework, clients, servers, decorators, and transport abstraction | `@nestjs/common`, `@nestjs/core`, `@nestjs/websockets` (optional) |
+| `@nestjs/testing` | `Test`, `TestingModule`, `TestingModuleBuilder` | `@nestjs/common`, `@nestjs/core`, `@nestjs/microservices` (optional), `@nestjs/platform-express` (optional) |
+
+## `@nestjs/common`
+
+This is the shared layer. Every other NestJS package depends on it. Its `index.ts` exports decorators, enums, exceptions, file-stream utilities, pipes, a serializer, services (logger, reflector), and internal helpers. Start here when you want to understand a decorator contract or a shared interface.
+
+Key directories:
+
+- `decorators/` : route and provider decorators (e.g. `@Controller`, `@Injectable`)
+- `exceptions/` : built-in HTTP exceptions (e.g. `BadRequestException`)
+- `interfaces/` : shared contracts (`INestApplication`, `ExecutionContext`, `CanActivate`, `NestInterceptor`, etc.)
+- `pipes/` : built-in pipes (e.g. `ValidationPipe`)
+- `services/` : `Logger`, `ConsoleLogger`, `Reflector`
+
+## `@nestjs/core`
+
+This is the heart of the framework. Its `index.ts` re-exports the adapters, application config, discovery, exceptions, helpers, injector, inspector, metadata-scanner, middleware, application classes, router, and services. Nearly every internals page in this site points to code inside `@nestjs/core`.
+
+Key directories:
+
+| Directory | What it contains | Where to start reading |
+| --- | --- | --- |
+| `injector/` | `NestContainer`, `Module`, `Injector`, `InstanceLoader`, `InstanceWrapper`, `ModuleRef`, lazy loading | [Modules and Container](/di/modules-and-container), [Injector](/di/injector), [Instance Loader](/di/instance-loader) |
+| `router/` | `RoutesResolver`, `RouterExplorer`, `RouterExecutionContext`, `RouterProxy`, `RouterResponseController` | [Routing](/http/routing), [Request Lifecycle](/http/request-lifecycle) |
+| `middleware/` | `MiddlewareModule`, `RoutesMapper`, `MiddlewareContainer`, `MiddlewareResolver` | [Middleware](/http/middleware) |
+| `guards/` | `GuardsConsumer`, `GuardsContextCreator` | [Guards](/http/guards) |
+| `interceptors/` | `InterceptorsConsumer`, `InterceptorsContextCreator` | [Interceptors](/http/interceptors) |
+| `pipes/` | `PipesConsumer`, `PipesContextCreator` | [Pipes](/http/pipes) |
+| `exceptions/` | `BaseExceptionFilter`, `ExceptionsHandler`, external exception handling | [Exception Filters](/http/exception-filters) |
+| `helpers/` | `ExecutionContextHost`, `ContextUtils`, `ContextIdFactory`, `ExternalContextCreator`, router utilities | [Execution Context](/http/execution-context) |
+| `discovery/` | `DiscoveryService`, `DiscoveryModule`, `DiscoverableMetaHostCollection` | [Discovery and Inspector](/extending/discovery-and-inspector) |
+| `inspector/` | `GraphInspector`, `SerializedGraph`, `UuidFactory`, noop graph inspector | [Discovery and Inspector](/extending/discovery-and-inspector) |
+| `hooks/` | Lifecycle hook runners (`on-module-init`, `on-module-destroy`, `on-app-bootstrap`, `on-app-shutdown`, `before-app-shutdown`) | [Lifecycle Hooks](/overview/lifecycle-hooks) |
+| `adapters/` | `AbstractHttpAdapter`, HTTP adapter contract | [HTTP Adapters](/platforms/http-adapters) |
+| `services/` | `Reflector` service exported from core | [Metadata and Reflection](/di/metadata-and-reflection) |
+| `repl/` | REPL context, native REPL functions and commands | Internal developer tooling |
+| `errors/` | Internal exception classes and `ExceptionsZone` | Boot error handling |
+
+## `@nestjs/platform-express`
+
+This package adapts the Express server into the NestJS abstraction layer. Its `index.ts` exports the adapter and interfaces. The main file is `adapters/express-adapter.ts`, which implements `AbstractHttpAdapter` and bridges NestJS routing to Express. Start here if you want to see how the default HTTP server is wired.
+
+## `@nestjs/platform-fastify`
+
+This package adapts Fastify instead of Express. Its `index.ts` exports the adapter, interfaces, and decorators. The main file is `adapters/fastify-adapter.ts`. Start here if you want to understand how NestJS supports multiple HTTP engines.
+
+## `@nestjs/websockets`
+
+This package provides the WebSocket gateway framework. Its `index.ts` exports adapters, decorators, errors, exceptions, interfaces, and `GatewayMetadataExplorer`. It abstracts the gateway lifecycle and message mapping, but delegates the actual transport to `@nestjs/platform-socket.io` or `@nestjs/platform-ws`.
+
+## `@nestjs/microservices`
+
+This package provides the full microservice framework, including client proxies, server abstractions, decorators, events, exceptions, helpers, and record builders. Its `index.ts` re-exports the client layer, context host, decorators, enums, events, exceptions, helpers, interfaces, module utilities, `NestMicroservice`, record builders, server layer, and tokens.
+
+## `@nestjs/testing`
+
+This package mirrors the production boot path for unit and integration tests. Its `index.ts` exports `Test`, `TestingModule`, and `TestingModuleBuilder`. Under the hood, `TestingModuleBuilder` creates a `NestContainer` and runs the same scanner/loader sequence as `NestFactory`. Start here if you want to understand how tests set up the DI graph without an HTTP server.
+
+## Dependency direction
+
+At build time, the dependency arrows point like this:
+
+```text
+@nestjs/common
+    ↑
+@nestjs/core -------------- optional peers: platform-express, microservices, websockets
+    ↑
+platform-express, platform-fastify
+    ↑
+websockets ← platform-socket.io, platform-ws
+    ↑
+microservices
+    ↑
+testing -------------- optional peers: microservices, platform-express
+```
+
+All optional peer dependencies are declared in `peerDependenciesMeta` as optional. This means `@nestjs/core` can compile without `@nestjs/websockets` or `@nestjs/microservices`, but if those packages are present at runtime the core will integrate them.
+
+## Where to start for each subsystem
+
+If you are investigating a specific part of NestJS, start in the following files:
+
+| Subsystem | Package | Entry file to read |
+| --- | --- | --- |
+| Application bootstrap | `@nestjs/core` | `nest-factory.ts` |
+| Module scanning | `@nestjs/core` | `scanner.ts` |
+| Dependency resolution | `@nestjs/core` | `injector/injector.ts` |
+| Instance creation | `@nestjs/core` | `injector/instance-loader.ts` |
+| Container storage | `@nestjs/core` | `injector/container.ts` |
+| Route registration | `@nestjs/core` | `router/routes-resolver.ts` |
+| Handler discovery | `@nestjs/core` | `router/router-explorer.ts` |
+| Request execution | `@nestjs/core` | `router/router-execution-context.ts` |
+| Middleware | `@nestjs/core` | `middleware/middleware-module.ts` |
+| Guards | `@nestjs/core` | `guards/guards-consumer.ts` |
+| Interceptors | `@nestjs/core` | `interceptors/interceptors-consumer.ts` |
+| Pipes | `@nestjs/core` | `pipes/pipes-consumer.ts` |
+| Exception handling | `@nestjs/core` | `exceptions/exceptions-handler.ts` |
+| HTTP adapter contract | `@nestjs/core` | `adapters/http-adapter.ts` |
+| Express integration | `@nestjs/platform-express` | `adapters/express-adapter.ts` |
+| Fastify integration | `@nestjs/platform-fastify` | `adapters/fastify-adapter.ts` |
+| WebSocket gateways | `@nestjs/websockets` | `adapters/` and `gateway-metadata-explorer.ts` |
+| Microservices | `@nestjs/microservices` | `nest-microservice.ts` and `server/` |
+| Testing setup | `@nestjs/testing` | `testing-module.builder.ts` |
+
+## Source files
+
+| Path | Responsibility |
+| --- | --- |
+| `packages/common/index.ts` | Public exports of decorators, exceptions, pipes, services |
+| `packages/core/index.ts` | Public exports of the DI container, router, helpers, and services |
+| `packages/core/internal.ts` | Internal-only exports for cross-package consumption |
+| `packages/platform-express/index.ts` | Exports the Express adapter and interfaces |
+| `packages/platform-fastify/index.ts` | Exports the Fastify adapter, interfaces, and decorators |
+| `packages/websockets/index.ts` | Exports the WebSocket gateway framework and adapters |
+| `packages/microservices/index.ts` | Exports the microservice client/server framework |
+| `packages/testing/index.ts` | Exports `Test`, `TestingModule`, and `TestingModuleBuilder` |
+
+## Related pages
+
+- [Bootstrap](/overview/bootstrap)
+- [Modules and Container](/di/modules-and-container)
+- [HTTP Adapters](/platforms/http-adapters)
+- [Request Lifecycle](/http/request-lifecycle)
+- [Testing and Extensibility](/extending/testing)

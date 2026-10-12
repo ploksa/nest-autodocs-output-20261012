@@ -1,0 +1,296 @@
+---
+title: "NestJS Lifecycle Hooks: Init, Bootstrap, and Shutdown Flow"
+sidebarTitle: "Lifecycle Hooks"
+description: "Learn how NestJS lifecycle hooks fire across modules during initialization and shutdown, including hook call order, instance eligibility, and signal handling."
+---
+
+NestJS provides five lifecycle hooks that let providers, controllers, and modules react to application state changes. The `NestApplicationContext` class orchestrates these hooks by sorting modules by distance (depth in the dependency graph), then calling hook helpers in `packages/core/hooks` that iterate over each module's instances.
+
+## Hook interfaces
+
+All hooks are defined as TypeScript interfaces in `packages/common/interfaces/hooks`:
+
+```ts packages/common/interfaces/hooks/on-init.interface.ts
+export interface OnModuleInit {
+  onModuleInit(): any;
+}
+```
+
+```ts packages/common/interfaces/hooks/on-application-bootstrap.interface.ts
+export interface OnApplicationBootstrap {
+  onApplicationBootstrap(): any;
+}
+```
+
+```ts packages/common/interfaces/hooks/on-destroy.interface.ts
+export interface OnModuleDestroy {
+  onModuleDestroy(): any;
+}
+```
+
+```ts packages/common/interfaces/hooks/before-application-shutdown.interface.ts
+export interface BeforeApplicationShutdown {
+  beforeApplicationShutdown(signal?: string): any;
+}
+```
+
+```ts packages/common/interfaces/hooks/on-application-shutdown.interface.ts
+export interface OnApplicationShutdown {
+  onApplicationShutdown(signal?: string): any;
+}
+```
+
+## Which instances receive hooks
+
+Hook helpers filter instances by two rules:
+
+1. **Static dependency tree only**: `wrapper.isDependencyTreeStatic()` must return `true`. If a class or any of its transitive dependencies are request-scoped (`Scope.REQUEST`), the class is skipped because it cannot be eagerly instantiated at bootstrap.
+2. **Non-transient or static transient**: Regular singletons are always included. For transient providers, only their static transient instances (pre-created eagerly) are included via `getStaticTransientInstances()`.
+
+```ts packages/core/hooks/utils/get-instances-grouped-by-hierarchy-level.ts
+for (const [_, wrapper] of collection) {
+  if (!wrapper.isDependencyTreeStatic()) {
+    continue;
+  }
+
+  const level = wrapper.hierarchyLevel;
+  if (wrapper.isTransient) {
+    const staticTransientInstances = wrapper
+      .getStaticTransientInstances()
+      .filter(i => !!i)
+      .map(i => i.instance);
+    byHierarchyLevelGroup!.push(...staticTransientInstances);
+    continue;
+  }
+
+  if (wrapper.instance) {
+    byHierarchyLevelGroup!.push(wrapper.instance);
+  }
+}
+```
+
+## Hook call order across modules
+
+`NestApplicationContext` sorts modules by `distance` (a numeric depth computed during scanning) and iterates them in that order.
+
+<Steps>
+  <Step title="Init and bootstrap: farthest first">
+    `callInitHook()` and `callBootstrapHook()` sort modules by descending distance. Leaf modules (greatest distance) run first; the root module (distance 0) runs last.
+  </Step>
+  <Step title="Destroy and shutdown: reverse order">
+    `callDestroyHook()`, `callBeforeShutdownHook()`, and `callShutdownHook()` reverse the distance-sorted array. The root module runs first; leaf modules run last.
+  </Step>
+</Steps>
+
+```ts packages/core/nest-application-context.ts
+protected async callInitHook(): Promise<void> {
+  const modulesSortedByDistance = this.getModulesToTriggerHooksOn();
+  for (const module of modulesSortedByDistance) {
+    await callModuleInitHook(module);
+  }
+}
+
+protected async callDestroyHook(): Promise<void> {
+  const modulesSortedByDistance = [
+    ...this.getModulesToTriggerHooksOn(),
+  ].reverse();
+
+  for (const module of modulesSortedByDistance) {
+    await callModuleDestroyHook(module);
+  }
+}
+```
+
+## Per-module instance ordering
+
+Within a single module, instances are grouped by `hierarchyLevel` (a number representing the depth in the module's own dependency graph) and called in sorted order. Init and bootstrap use ascending order (dependencies before dependents); destroy and shutdown use descending order (dependents before dependencies).
+
+```ts packages/core/hooks/on-module-init.hook.ts
+const levels = getSortedHierarchyLevels(groupedInstances);
+for (const level of levels) {
+  await Promise.all(callOperator(groupedInstances.get(level)!));
+}
+
+// Call the module class itself last
+const moduleClassInstance = moduleClassHost.instance;
+if (
+  moduleClassInstance &&
+  hasOnModuleInitHook(moduleClassInstance) &&
+  moduleClassHost.isDependencyTreeStatic()
+) {
+  await moduleClassInstance.onModuleInit();
+}
+```
+
+```ts packages/core/hooks/on-module-destroy.hook.ts
+const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
+for (const level of levels) {
+  const results = await Promise.allSettled(
+    callOperator(groupedInstances.get(level)!),
+  );
+  results
+    .filter(
+      (result): result is PromiseRejectedResult =>
+        result.status === 'rejected',
+    )
+    .forEach(result =>
+      Logger.error(result.reason, (result.reason as Error)?.stack),
+    );
+}
+```
+
+<Note>
+  The module class instance (the `@Module` decorated class) is always called last during init/bootstrap and first during destroy/shutdown, provided it is statically resolvable.
+</Note>
+
+## Complete lifecycle sequences
+
+### Initialization sequence
+
+<Steps>
+  <Step title="NestFactory.initialize()">
+    Scanner and instance loader finish. `NestApplication.init()` is called (or `NestApplicationContext.init()` for headless contexts).
+  </Step>
+  <Step title="callInitHook()">
+    Fires `OnModuleInit` on all eligible instances, leaf modules first, hierarchy levels ascending.
+  </Step>
+  <Step title="registerRouterHooks()">
+    Registers 404 and exception handlers (HTTP apps only).
+  </Step>
+  <Step title="callBootstrapHook()">
+    Fires `OnApplicationBootstrap` on all eligible instances, leaf modules first, hierarchy levels ascending.
+  </Step>
+</Steps>
+
+### Shutdown sequence
+
+Shutdown can be triggered by `app.close()` or OS signals.
+
+<Steps>
+  <Step title="prepareClose()">
+    `NestApplication` signals the HTTP adapter to begin graceful shutdown. `NestApplicationContext` does nothing.
+  </Step>
+  <Step title="callDestroyHook()">
+    Fires `OnModuleDestroy` on all eligible instances, root module first, hierarchy levels descending.
+  </Step>
+  <Step title="callBeforeShutdownHook(signal)">
+    Fires `BeforeApplicationShutdown(signal)` on all eligible instances, root module first, hierarchy levels descending.
+  </Step>
+  <Step title="dispose()">
+    `NestApplication` closes WebSocket module, microservices module, HTTP adapter, and any connected microservices. `NestApplicationContext` does nothing.
+  </Step>
+  <Step title="callShutdownHook(signal)">
+    Fires `OnApplicationShutdown(signal)` on all eligible instances, root module first, hierarchy levels descending.
+  </Step>
+  <Step title="unsubscribeFromProcessSignals()">
+    Removes process signal listeners so the application does not attempt a second shutdown.
+  </Step>
+</Steps>
+
+## Signal-based shutdown
+
+`enableShutdownHooks()` registers listeners for OS signals. If no signals are passed, it listens to all values in the `ShutdownSignal` enum.
+
+```ts packages/core/nest-application-context.ts
+public enableShutdownHooks(
+  signals: (ShutdownSignal | string)[] = [],
+  options: ShutdownHooksOptions = {},
+): this {
+  if (!signals || isEmptyArray(signals)) {
+    signals = Object.values(ShutdownSignal);
+  } else {
+    signals = Array.from(new Set(signals));
+  }
+
+  signals = iterate(signals)
+    .map((signal: string) => signal.toString().toUpperCase().trim())
+    .filter(signal => !this.activeShutdownSignals.includes(signal))
+    .toArray();
+
+  this.listenToShutdownSignals(signals, options);
+  return this;
+}
+```
+
+When a signal arrives, the cleanup callback runs the full shutdown sequence. A guard flag (`receivedSignal`) prevents re-entrant shutdowns. If `useProcessExit` is `true`, the process exits with code 0 after shutdown hooks complete; otherwise the signal is re-sent to the process.
+
+```ts packages/core/nest-application-context.ts
+const cleanup = async (signal: string) => {
+  try {
+    if (receivedSignal) {
+      return;
+    }
+    receivedSignal = true;
+    await this.initializationPromise;
+    await this.prepareClose();
+    await this.callDestroyHook();
+    await this.callBeforeShutdownHook(signal);
+    await this.dispose();
+    await this.callShutdownHook(signal);
+    signals.forEach(sig => process.removeListener(sig, cleanup));
+
+    if (options.useProcessExit) {
+      process.exit(0);
+    } else {
+      process.kill(process.pid, signal);
+    }
+  } catch (err) {
+    Logger.error(
+      MESSAGES.ERROR_DURING_SHUTDOWN,
+      (err as Error)?.stack,
+      NestApplicationContext.name,
+    );
+    process.exit(1);
+  }
+};
+```
+
+<Warning>
+  If an error occurs during shutdown, the process exits with code 1 regardless of the `useProcessExit` setting.
+</Warning>
+
+## Error handling during hooks
+
+Init and bootstrap hooks (`OnModuleInit`, `OnApplicationBootstrap`) run with `Promise.all()`. If any hook rejects, the error propagates up and aborts initialization (unless `abortOnError` is `false`).
+
+Destroy and shutdown hooks (`OnModuleDestroy`, `BeforeApplicationShutdown`, `OnApplicationShutdown`) run with `Promise.allSettled()`. Rejections are logged via `Logger.error()` but do not block subsequent hooks or prevent the shutdown sequence from completing.
+
+## Preview mode
+
+When `preview: true` is set, providers and controllers are not instantiated. Only modules with `initOnPreview` set receive hooks. This mode is useful for static analysis tools that need the module graph without side effects.
+
+## Summary table
+
+| Hook | Interface | Direction | Order within module | Error policy |
+| --- | --- | --- | --- | --- |
+| `OnModuleInit` | `OnModuleInit` | Leaf to root | Hierarchy ascending | Throw (abort) |
+| `OnApplicationBootstrap` | `OnApplicationBootstrap` | Leaf to root | Hierarchy ascending | Throw (abort) |
+| `OnModuleDestroy` | `OnModuleDestroy` | Root to leaf | Hierarchy descending | Log error, continue |
+| `BeforeApplicationShutdown` | `BeforeApplicationShutdown` | Root to leaf | Hierarchy descending | Log error, continue |
+| `OnApplicationShutdown` | `OnApplicationShutdown` | Root to leaf | Hierarchy descending | Log error, continue |
+
+## Source files
+
+| Path | Responsibility |
+| --- | --- |
+| `packages/core/nest-application-context.ts` | Orchestrates hook calls, module distance sorting, signal handling |
+| `packages/core/nest-application.ts` | HTTP-specific shutdown (`prepareClose`, `dispose`) |
+| `packages/core/hooks/on-module-init.hook.ts` | Fires `OnModuleInit` per module |
+| `packages/core/hooks/on-app-bootstrap.hook.ts` | Fires `OnApplicationBootstrap` per module |
+| `packages/core/hooks/on-module-destroy.hook.ts` | Fires `OnModuleDestroy` per module |
+| `packages/core/hooks/before-app-shutdown.hook.ts` | Fires `BeforeApplicationShutdown` per module |
+| `packages/core/hooks/on-app-shutdown.hook.ts` | Fires `OnApplicationShutdown` per module |
+| `packages/core/hooks/utils/get-instances-grouped-by-hierarchy-level.ts` | Filters eligible instances by static tree and hierarchy level |
+| `packages/core/hooks/utils/get-sorted-hierarchy-levels.ts` | Sorts hierarchy levels ASC or DESC |
+| `packages/common/interfaces/hooks/on-init.interface.ts` | `OnModuleInit` interface |
+| `packages/common/interfaces/hooks/on-application-bootstrap.interface.ts` | `OnApplicationBootstrap` interface |
+| `packages/common/interfaces/hooks/on-destroy.interface.ts` | `OnModuleDestroy` interface |
+| `packages/common/interfaces/hooks/before-application-shutdown.interface.ts` | `BeforeApplicationShutdown` interface |
+| `packages/common/interfaces/hooks/on-application-shutdown.interface.ts` | `OnApplicationShutdown` interface |
+
+## Related pages
+
+- [Bootstrap](/overview/bootstrap)
+- [Modules and Container](/di/modules-and-container)
+- [Dependency Scanner](/di/dependency-scanner)
+- [Instance Loader](/di/instance-loader)

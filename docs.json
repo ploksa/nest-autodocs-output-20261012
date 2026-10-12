@@ -1,54 +1,72 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "theme": "luma",
+  "name": "Nest Framework Internals",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#E0234E",
+    "light": "#F0476B",
+    "dark": "#B81D40"
   },
   "favicon": "/favicon.svg",
   "navigation": {
-    "pages": [
+    "groups": [
       {
-        "group": "Getting Started",
+        "group": "Overview",
         "pages": [
           "index",
-          "quickstart"
+          "overview/package-map",
+          "overview/bootstrap",
+          "overview/lifecycle-hooks"
+        ]
+      },
+      {
+        "group": "Dependency Injection",
+        "pages": [
+          "di/modules-and-container",
+          "di/dependency-scanner",
+          "di/instance-loader",
+          "di/injector",
+          "di/scopes-and-instance-wrapper",
+          "di/module-ref-and-lazy-loading",
+          "di/metadata-and-reflection"
+        ]
+      },
+      {
+        "group": "Request Pipeline",
+        "pages": [
+          "http/request-lifecycle",
+          "http/routing",
+          "http/execution-context",
+          "http/middleware",
+          "http/guards",
+          "http/pipes",
+          "http/interceptors",
+          "http/exception-filters"
+        ]
+      },
+      {
+        "group": "Platforms and Transports",
+        "pages": [
+          "platforms/http-adapters",
+          "platforms/express",
+          "platforms/fastify",
+          "platforms/websockets",
+          "platforms/microservices"
+        ]
+      },
+      {
+        "group": "Testing and Extensibility",
+        "pages": [
+          "extending/testing",
+          "extending/discovery-and-inspector",
+          "extending/extension-points"
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
+    ]
   },
   "logo": {
     "light": "/logo/light.svg",
     "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
   },
   "contextual": {
     "options": [
@@ -61,12 +79,5 @@
       "cursor",
       "vscode"
     ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
   }
 }

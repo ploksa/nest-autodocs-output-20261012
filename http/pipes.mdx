@@ -1,0 +1,491 @@
+---
+title: "Pipe Execution and Param Transformation"
+description: "How PipesContextCreator resolves pipe metadata, how PipesConsumer applies pipes to each argument, and how the built-in parse and validation pipes behave."
+sidebarTitle: "Pipes Execution"
+---
+
+Pipes in Nest transform and validate method arguments before a route handler executes. A `ParseIntPipe` might turn a string parameter into a number, while a `ValidationPipe` may enforce DTO rules and reject malformed payloads with a `400 Bad Request`.
+
+This page covers the internal plumbing that makes pipes work. It starts with the `PipesContextCreator` resolving pipe metadata, moves through `PipesConsumer.apply` running pipes in series, and walks through each built-in pipe in `packages/common/pipes` so you know what they validate and how they fail.
+
+## The PipeTransform Interface
+
+A pipe implements the `PipeTransform` interface from `packages/common/interfaces/features/pipe-transform.interface.ts`:
+
+```ts packages/common/interfaces/features/pipe-transform.interface.ts
+export interface PipeTransform<T = any, R = any> {
+  transform(value: T, metadata: ArgumentMetadata): R;
+}
+
+export interface ArgumentMetadata<Metatype = any> {
+  readonly type: Paramtype;
+  readonly metatype?: Type<Metatype> | undefined;
+  readonly data?: string | undefined;
+  readonly schema?: StandardSchemaV1;
+}
+```
+
+`value` is the raw argument extracted from the request. `metadata` tells the pipe whether the value came from the body, query, param, or a custom decorator, and what TypeScript type the parameter was declared with.
+
+Pipes can be applied at four levels, resolved in this priority order by the framework:
+
+1. **Global** via `app.useGlobalPipes(...)`
+2. **Controller** via `@UsePipes(...)` on the class
+3. **Method** via `@UsePipes(...)` on the handler
+4. **Parameter** via passing a pipe instance directly to `@Body(...)`, `@Query(...)`, or `@Param(...)`
+
+## Gathering Pipe Instances
+
+`PipesContextCreator` in `packages/core/pipes/pipes-context-creator.ts` creates the ordered array of `PipeTransform` instances for a given route handler.
+
+### Resolving Metadata and Instances
+
+Like guards and interceptors, pipe resolution uses the shared `ContextCreator` base class, then finishes with `createConcreteContext` to instantiate each class or accept bare objects.
+
+```ts packages/core/pipes/pipes-context-creator.ts
+export class PipesContextCreator extends ContextCreator {
+  public create(
+    instance: Controller,
+    callback: (...args: unknown[]) => unknown,
+    moduleKey: string,
+    contextId = STATIC_CONTEXT,
+    inquirerId?: string,
+  ): PipeTransform[] {
+    this.moduleContext = moduleKey;
+    return this.createContext(
+      instance,
+      callback,
+      PIPES_METADATA,
+      contextId,
+      inquirerId,
+    );
+  }
+}
+```
+
+`createContext` merges three layers into a single flat array: global pipes, controller-level pipes, and method-level pipes. Parameter-level pipes are merged later by `RouterExecutionContext` into the per-parameter pipe chain.
+
+### Instantiating Pipe Classes
+
+`createConcreteContext` walks the metadata entries, instantiates each class from the module's injectable collection, and keeps only items that have a valid `transform` method:
+
+```ts packages/core/pipes/pipes-context-creator.ts
+public createConcreteContext<T extends any[], R extends any[]>(
+  metadata: T,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): R {
+  if (isEmpty(metadata)) {
+    return [] as any[] as R;
+  }
+  return iterate(metadata)
+    .filter((pipe: any) => pipe && (pipe.name || pipe.transform))
+    .map(pipe => this.getPipeInstance(pipe, contextId, inquirerId))
+    .filter(pipe => !!pipe && pipe.transform && isFunction(pipe.transform))
+    .toArray() as R;
+}
+```
+
+`getPipeInstance` respects context ID and inquirer ID for scoped providers:
+
+```ts packages/core/pipes/pipes-context-creator.ts
+public getPipeInstance(
+  pipe: Function | PipeTransform,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): PipeTransform | null {
+  const isObject = !!(pipe as PipeTransform).transform;
+  if (isObject) {
+    return pipe as PipeTransform;
+  }
+  const instanceWrapper = this.getInstanceByMetatype(pipe as Type<unknown>);
+  if (!instanceWrapper) {
+    return null;
+  }
+  const instanceHost = instanceWrapper.getInstanceByContextId(
+    this.getContextId(contextId, instanceWrapper),
+    inquirerId,
+  );
+  return instanceHost && instanceHost.instance;
+}
+```
+
+### Global Metadata and Scoped Providers
+
+Global pipes are fetched from `ApplicationConfig`, and request-scoped `APP_PIPE` providers are also resolved when the current execution is not the static context.
+
+```ts packages/core/pipes/pipes-context-creator.ts
+public getGlobalMetadata<T extends unknown[]>(
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): T {
+  if (!this.config) {
+    return [] as unknown[] as T;
+  }
+  const globalPipes = this.config.getGlobalPipes() as T;
+  if (contextId === STATIC_CONTEXT && !inquirerId) {
+    return globalPipes;
+  }
+  const scopedPipeWrappers =
+    this.config.getGlobalRequestPipes() as InstanceWrapper[];
+  const scopedPipes = iterate(scopedPipeWrappers)
+    .map(wrapper =>
+      wrapper.getInstanceByContextId(
+        this.getContextId(contextId, wrapper),
+        inquirerId,
+      ),
+    )
+    .filter(host => !!host)
+    .map(host => host.instance)
+    .toArray();
+  return globalPipes.concat(scopedPipes) as T;
+}
+```
+
+<Note>
+  At the time `RouterExecutionContext` calls `PipesContextCreator.create`, the module-level context has already been set, so every pipe is looked up in the correct module's injectable collection first.
+</Note>
+
+## Running the Pipe Chain
+
+Once the pipe array is ready, the framework applies it to each parameter via `PipesConsumer`.
+
+### Consumer Flow
+
+`PipesConsumer` lives in `packages/core/pipes/pipes-consumer.ts`. It exposes two public methods, `apply` and `applyPipes`. `apply` is the entry point called for each parameter, and its job is to map the numeric `RouteParamtypes` to string tokens before handing off to `applyPipes`:
+
+```ts packages/core/pipes/pipes-consumer.ts
+export class PipesConsumer {
+  private readonly paramsTokenFactory = new ParamsTokenFactory();
+
+  public async apply<TInput = unknown>(
+    value: TInput,
+    metadata: ArgumentMetadata,
+    pipes: PipeTransform[],
+  ) {
+    const token = this.paramsTokenFactory.exchangeEnumForString(
+      metadata.type as any as RouteParamtypes,
+    );
+    return this.applyPipes(
+      value,
+      {
+        metatype: metadata.metatype,
+        type: token,
+        data: metadata.data,
+        schema: metadata.schema,
+      },
+      pipes,
+    );
+  }
+}
+```
+
+### Token Factory
+
+`ParamsTokenFactory` converts internal numeric route param types into readable string kinds.
+
+```ts packages/core/pipes/params-token-factory.ts
+export class ParamsTokenFactory {
+  public exchangeEnumForString(type: RouteParamtypes): Paramtype {
+    switch (type) {
+      case RouteParamtypes.BODY:
+        return 'body';
+      case RouteParamtypes.PARAM:
+        return 'param';
+      case RouteParamtypes.QUERY:
+        return 'query';
+      default:
+        return 'custom';
+    }
+  }
+}
+```
+
+The `custom` fallback is important for user-defined parameter decorators. It means your own `@User()` decorator will still be visible to pipes as a custom parameter type.
+
+### Applying PipeSeries
+
+`applyPipes` runs the pipe array left-to-right, feeding each output into the next pipe's input. This is the point of transformation and validation.
+
+```ts packages/core/pipes/pipes-consumer.ts
+public async applyPipes<TInput = unknown>(
+  value: TInput,
+  { metatype, type, data, schema }: ArgumentMetadata,
+  transforms: PipeTransform[],
+) {
+  let result: unknown = value;
+  for (const pipe of transforms) {
+    result = await pipe.transform(result, { metatype, type, data, schema });
+  }
+  return result;
+}
+```
+
+If any pipe throws, the exception propagates immediately and the handler will never execute. The exception is caught by the router proxy and passed to the exception filter chain.
+
+## Where Pipes Sit in the Request Pipeline
+
+In `RouterExecutionContext.create`, pipes are gathered before guards and interceptors, but at runtime they execute after guards and inside the interceptor-wrapped handler. The proxy function in `packages/core/router/router-execution-context.ts` builds a `handler` closure that calls `fnApplyPipes` just before the route handler:
+
+```ts packages/core/router/router-execution-context.ts
+const handler =
+  <TRequest, TResponse>(
+    args: any[],
+    req: TRequest,
+    res: TResponse,
+    next: Function,
+  ) =>
+  async () => {
+    fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+    return callback.apply(instance, args);
+  };
+```
+
+This `handler` is passed into `interceptorsConsumer.intercept(...)`, which means:
+
+1. Guards run first (`fnCanActivate`)
+2. Interceptors wrap the entire operation
+3. Inside the interceptor chain, pipes transform parameters
+4. The route handler finally receives the transformed arguments
+
+## Built-in Pipes in packages/common/pipes
+
+Nest ships with a family of built-in pipes that cover common parsing and validation tasks. Below is a summary of each pipe, what it does, and where to find it.
+
+### DefaultValuePipe
+
+**File:** `packages/common/pipes/default-value.pipe.ts`
+
+Replaces `null`, `undefined`, or `NaN` with a configured default value. It is useful for optional query parameters that you want to fall back to a sensible default.
+
+```ts packages/common/pipes/default-value.pipe.ts
+export class DefaultValuePipe<T = any, R = any> implements PipeTransform<T, T | R> {
+  constructor(protected readonly defaultValue: R) {}
+
+  transform(value?: T, _metadata?: ArgumentMetadata): T | R {
+    if (isNil(value) || (isNumber(value) && isNaN(value as unknown as number))) {
+      return this.defaultValue;
+    }
+    return value;
+  }
+}
+```
+
+Example usage:
+
+```ts
+@Get()
+findAll(
+  @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+) {
+  return this.service.findAll(page);
+}
+```
+
+### ParseIntPipe
+
+**File:** `packages/common/pipes/parse-int.pipe.ts`
+
+Validates that a value is numeric, then calls `parseInt(String(value), 10)`. If validation fails, it throws a `BadRequestException` by default.
+
+```ts packages/common/pipes/parse-int.pipe.ts
+export class ParseIntPipe implements PipeTransform {
+  async transform(value: unknown, metadata: ArgumentMetadata): Promise<number | undefined | null> {
+    if (isNil(value) && this.options?.optional) {
+      return value;
+    }
+    if (!this.isNumeric(value)) {
+      throw this.exceptionFactory('Validation failed (numeric string is expected)');
+    }
+    return parseInt(String(value), 10);
+  }
+}
+```
+
+Options include:
+
+- `errorHttpStatusCode` - which error code to throw on failure (default `400`)
+- `exceptionFactory` - a custom factory for the thrown error
+- `optional` - whether to allow `null` or `undefined` without error
+
+### ParseFloatPipe
+
+**File:** `packages/common/pipes/parse-float.pipe.ts`
+
+Like `ParseIntPipe`, but uses `parseFloat` instead. It validates that the value is numeric, then returns a floating-point number. Options mirror `ParseIntPipe`.
+
+### ParseBoolPipe
+
+**File:** `packages/common/pipes/parse-bool.pipe.ts`
+
+Parses a string into a boolean. Supported values for `true` include `true`, `1`, and `'1'`. For `false`, `false`, `0`, and `'0'`. Any other input triggers a `BadRequestException` or a custom error if configured.
+
+### ParseUUIDPipe
+
+**File:** `packages/common/pipes/parse-uuid.pipe.ts`
+
+Validates that a value matches a UUID pattern. It supports versions 3, 4, 5, and 7, plus the default `'all'` pattern that accepts any standard UUID without strict version prefix checks.
+
+```ts packages/common/pipes/parse-uuid.pipe.ts
+protected static uuidRegExps = {
+  3: /^[0-9A-F]{8}-[0-9A-F]{4}-3[0-9A-F]{3}-[0-9A-F]{4}-[0-9A-F]{12}$/i,
+  4: /^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+  5: /^[0-9A-F]{8}-[0-9A-F]{4}-5[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+  7: /^[0-9A-F]{8}-[0-9A-F]{4}-7[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$/i,
+  all: /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i,
+};
+```
+
+If validation fails, the default message is `Validation failed (uuid is expected)`.
+
+### ParseDatePipe
+
+**File:** `packages/common/pipes/parse-date.pipe.ts`
+
+Attempts to coerce an incoming value into a `Date` object using `new Date(value)`. A failed parse throws a `BadRequestException` or a custom exception factory if configured.
+
+### ParseEnumPipe
+
+**File:** `packages/common/pipes/parse-enum.pipe.ts`
+
+Validates that an input value belongs to a given enum object. If the value is not present in the enum, it throws a `BadRequestException` by default.
+
+### ParseArrayPipe
+
+**File:** `packages/common/pipes/parse-array.pipe.ts`
+
+Splits a string by a configurable separator and optionally validates or transforms each item. It delegates item transformation and validation to an internal `ValidationPipe` instance.
+
+Options include:
+
+- `items` - the expected TypeScript type for individual elements
+- `separator` - defaults to `,`
+- `optional` - whether to allow missing values
+
+### ParseFilePipe
+
+**File:** `packages/common/pipes/file/parse-file.pipe.ts`
+
+Validates uploaded files through a configurable list of `FileValidator` instances. If `fileIsRequired` is `true` (the default) and no file is present, it throws. Otherwise it runs each validator against each file.
+
+```ts packages/common/pipes/file/parse-file.pipe.ts
+export class ParseFilePipe implements PipeTransform {
+  async transform(value: unknown): Promise<any> {
+    const areThereAnyFilesIn = this.thereAreNoFilesIn(value);
+    if (areThereAnyFilesIn && this.fileIsRequired) {
+      throw this.exceptionFactory('File is required');
+    }
+    if (!areThereAnyFilesIn && this.validators.length) {
+      await this.validateFilesOrFile(value);
+    }
+    return value;
+  }
+}
+```
+
+Built-in validators in `packages/common/pipes/file/` include:
+
+- `MaxFileSizeValidator` - checks file byte size against a limit
+- `FileTypeValidator` - checks the MIME type or magic number pattern
+
+### ValidationPipe
+
+**File:** `packages/common/pipes/validation.pipe.ts`
+
+The most comprehensive built-in pipe. It performs class-based validation and transformation. `ValidationPipe` is a workhorse whose behavior is controlled through a large options object.
+
+When `transform` is `true`, the pipe uses the loaded `class-transformer` package to turn plain objects into class instances before validation. Validation itself runs through `class-validator`. The result is then handled based on `errorFormat`:
+
+- `'list'` (default) - flattens validation errors into an array of strings
+- `'grouped'` - returns a record keyed by property path
+
+```ts packages/common/pipes/validation.pipe.ts
+export class ValidationPipe implements PipeTransform {
+  async transform(value: unknown, metadata: ArgumentMetadata): Promise<unknown> {
+    // ... object transformation and validation logic ...
+  }
+}
+```
+
+Key constructor options include:
+
+- `transform` - enable class transformation
+- `transformOptions` - pass options like `excludeExtraneousValues`
+- `disableErrorMessages` - strip all error details from the response
+- `exceptionFactory` - a function that receives `ValidationError[]` and returns the thrown error
+- `expectedType` - override the declared metatype
+- `whitelist` - strip properties without decorators
+- `forbidNonWhitelisted` - throw on unexpected properties
+
+### StandardSchemaValidationPipe
+
+**File:** `packages/common/pipes/standard-schema-validation.pipe.ts`
+
+Accepts a Standard Schema-compatible schema from the `schema` field on `ArgumentMetadata`. It validates and transforms the value using the schema's built-in validation, making it compatible with libraries like Zod or Valibot that support the Standard Schema spec.
+
+## The @UsePipes Decorator
+
+Pipes are attached to classes and methods through the `@UsePipes` decorator in `packages/common/decorators/core/use-pipes.decorator.ts`:
+
+```ts packages/common/decorators/core/use-pipes.decorator.ts
+export function UsePipes(
+  ...pipes: (PipeTransform | Function)[]
+): ClassDecorator & MethodDecorator {
+  return (target, key, descriptor) => {
+    if (descriptor) {
+      extendArrayMetadata(PIPES_METADATA, pipes, descriptor.value);
+      return descriptor;
+    }
+    extendArrayMetadata(PIPES_METADATA, pipes, target);
+    return target;
+  };
+}
+```
+
+Each level stores its metadata separately, and `PipesContextCreator.createContext` merges them in global, class, method order.
+
+## RouterExecutionContext Integration
+
+`RouterExecutionContext.create` fetches pipes, parameters, and other enhancers in a single pass before building the route handler function. Pipes are resolved before guards and interceptors in the setup phase, but at request time validation failures happen inside the handler closure after guards have passed.
+
+```ts packages/core/router/router-execution-context.ts
+public create(
+  instance: Controller,
+  callback: (...args: any[]) => unknown,
+  methodName: string,
+  moduleKey: string,
+  // ...
+) {
+  const pipes = this.pipesContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  const guards = this.guardsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  // ...
+}
+```
+
+Inside the route handler proxy, `fnApplyPipes` is called before the handler runs so that every parameter is transformed and validated in order. If any pipe throws, the route handler body is never reached.
+
+## Source Files
+
+| File | Role |
+| --- | --- |
+| `packages/core/pipes/pipes-context-creator.ts` | Gathers pipe metadata from the DI container and creates concrete pipe instances. |
+| `packages/core/pipes/pipes-consumer.ts` | Applies pipes in series to each method argument. |
+| `packages/core/pipes/params-token-factory.ts` | Converts internal route param type constants to readable `'body'`, `'query'`, `'param'`, or `'custom'` tokens. |
+| `packages/common/interfaces/features/pipe-transform.interface.ts` | Defines the `PipeTransform` and `ArgumentMetadata` interfaces. |
+| `packages/common/decorators/core/use-pipes.decorator.ts` | Stores pipe metadata on controllers and methods via `@UsePipes`. |
+| `packages/common/pipes/validation.pipe.ts` | The class-validator-based validation and transformation pipe. |
+| `packages/common/pipes/parse-int.pipe.ts` | Parses and validates integer strings. |
+| `packages/common/pipes/parse-uuid.pipe.ts` | Validates UUID strings with version support. |
+| `packages/common/pipes/default-value.pipe.ts` | Supplies default values for missing or `NaN` arguments. |
+| `packages/common/pipes/parse-array.pipe.ts` | Splits and optionally transforms items from string arrays. |
+| `packages/common/pipes/file/parse-file.pipe.ts` | Validates uploaded files through a list of `FileValidator`s. |
+
+## See Also
+
+- [Guards](/http/guards) for access control that runs before pipes
+- [Interceptors](/http/interceptors) for how they wrap the handler including the pipe application step
+- [Exception Filters](/http/exception-filters) for how pipe errors are mapped to HTTP responses

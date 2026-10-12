@@ -1,0 +1,289 @@
+---
+title: "InstanceLoader: How Nest Instantiates the Module Graph"
+description: "InstanceLoader orchestrates two-phase instantiation of providers, injectables, and controllers via Injector dependency resolution."
+sidebarTitle: "Instance Loader"
+---
+
+After `DependenciesScanner` has populated every `Module` with metadata, the framework must turn the unresolved `InstanceWrapper` records into actual class instances. That work is performed by `InstanceLoader` in `packages/core/injector/instance-loader.ts`. It walks every module in the container, creates prototypes, resolves dependencies through the `Injector`, and records the results in the `GraphInspector`.
+
+This page explains the two-phase instantiation pipeline, the order in which providers, injectables, and controllers are materialized, how errors and circular dependencies are handled, and how the loader hands off to `Injector` methods for real construction.
+
+## The entry point: `createInstancesOfDependencies`
+
+`InstanceLoader.createInstancesOfDependencies` is called from the bootstrap sequence with the full `ModulesContainer` produced by the scanner. It has two sequential phases:
+
+<Steps>
+  <Step title="Create prototypes">
+    `createPrototypes` iterates every module and calls `injector.loadPrototype` for each provider, injectable, and controller. This builds the initial class instances (or proxy objects for scoped providers) before any cross-reference resolution happens.
+  </Step>
+  <Step title="Create instances">
+    `createInstances` iterates every module and calls `injector.loadProvider`, `injector.loadInjectable`, and `injector.loadController`. Dependencies are resolved, constructor arguments are injected, and property decorators are applied. Each resolved wrapper is then inspected by `graphInspector`.
+  </Step>
+</Steps>
+
+```ts packages/core/injector/instance-loader.ts
+public async createInstancesOfDependencies(
+  modules: Map<string, Module> = this.container.getModules(),
+) {
+  this.createPrototypes(modules);
+
+  try {
+    await this.createInstances(modules);
+  } catch (err) {
+    this.graphInspector.inspectModules(modules);
+    this.graphInspector.registerPartial(err);
+    throw err;
+  }
+  this.graphInspector.inspectModules(modules);
+}
+```
+
+If `createInstances` throws, the loader still calls `inspectModules` and `registerPartial` on the `GraphInspector` before rethrowing the error. This ensures that even a partially built graph is visible for debugging or serialized snapshots.
+
+## Phase 1: `createPrototypes`
+
+The prototype phase is fully synchronous. For every module, `InstanceLoader` calls `loadPrototype` on:
+
+1. **Providers** (`createPrototypesOfProviders`)
+2. **Injectables** (`createPrototypesOfInjectables`)
+3. **Controllers** (`createPrototypesOfControllers`)
+
+All modules are processed, but within a module the three collections are processed sequentially.
+
+```ts packages/core/injector/instance-loader.ts
+private createPrototypes(modules: Map<string, Module>) {
+  modules.forEach(moduleRef => {
+    this.createPrototypesOfProviders(moduleRef);
+    this.createPrototypesOfInjectables(moduleRef);
+    this.createPrototypesOfControllers(moduleRef);
+  });
+}
+
+private createPrototypesOfProviders(moduleRef: Module) {
+  const { providers } = moduleRef;
+  providers.forEach(wrapper =>
+    this.injector.loadPrototype<Injectable>(wrapper, providers),
+  );
+}
+
+private createPrototypesOfInjectables(moduleRef: Module) {
+  const { injectables } = moduleRef;
+  injectables.forEach(wrapper =>
+    this.injector.loadPrototype(wrapper, injectables),
+  );
+}
+
+private createPrototypesOfControllers(moduleRef: Module) {
+  const { controllers } = moduleRef;
+  controllers.forEach(wrapper =>
+    this.injector.loadPrototype<Controller>(wrapper, controllers),
+  );
+}
+```
+
+### What `loadPrototype` does
+
+`Injector.loadPrototype` creates an early instance via `InstanceWrapper.createPrototype` and replaces the wrapper in the module's collection with a new wrapper that carries the prototype.
+
+```ts packages/core/injector/injector.ts
+public loadPrototype<T>(
+  { token }: InstanceWrapper<T>,
+  collection: Map<InjectionToken, InstanceWrapper<T>>,
+  contextId = STATIC_CONTEXT,
+) {
+  if (!collection) {
+    return;
+  }
+  const target = collection.get(token)!;
+  const instance = target.createPrototype(contextId);
+  if (instance) {
+    const wrapper = new InstanceWrapper({
+      ...target,
+      instance,
+    });
+    collection.set(token, wrapper);
+  }
+}
+```
+
+For singleton-scoped classes, the prototype is typically the real instance. For request- and transient-scoped classes, `createPrototype` may return a proxy or a placeholder so that the wrapper slot exists before the demand-scoped resolution happens later.
+
+## Phase 2: `createInstances`
+
+The instance phase is asynchronous. Modules are processed in parallel via `Promise.all`, but within each module the three collections are resolved in order: providers first, then injectables, then controllers. Within each collection, every wrapper is resolved concurrently.
+
+```ts packages/core/injector/instance-loader.ts
+private async createInstances(modules: Map<string, Module>) {
+  await Promise.all(
+    [...modules.values()].map(async moduleRef => {
+      await this.createInstancesOfProviders(moduleRef);
+      await this.createInstancesOfInjectables(moduleRef);
+      await this.createInstancesOfControllers(moduleRef);
+
+      const { name } = moduleRef;
+      this.isModuleWhitelisted(name) &&
+        this.logger.log(MODULE_INIT_MESSAGE`${name}`);
+    }),
+  );
+}
+```
+
+After a module finishes, the loader logs a module initialization message for every module except `InternalCoreModule`.
+
+### Provider instantiation
+
+```ts packages/core/injector/instance-loader.ts
+private async createInstancesOfProviders(moduleRef: Module) {
+  const { providers } = moduleRef;
+  const wrappers = [...providers.values()];
+  await Promise.all(
+    wrappers.map(async item => {
+      await this.injector.loadProvider(item, moduleRef);
+      this.graphInspector.inspectInstanceWrapper(item, moduleRef);
+    }),
+  );
+}
+```
+
+`injector.loadProvider` delegates to `loadInstance` and then attaches enhancer metadata to the resolved wrapper via `loadEnhancersPerContext`.
+
+```ts packages/core/injector/injector.ts
+public async loadProvider(
+  wrapper: InstanceWrapper<Injectable>,
+  moduleRef: Module,
+  resolutionContext: ResolutionContext = { contextId: STATIC_CONTEXT },
+) {
+  if (this.shouldSkipProviderLoading(wrapper, resolutionContext)) {
+    return;
+  }
+  const providers = moduleRef.providers;
+  await this.loadInstance<Injectable>(
+    wrapper,
+    providers,
+    moduleRef,
+    resolutionContext,
+  );
+  await this.loadEnhancersPerContext(
+    wrapper,
+    resolutionContext.contextId,
+    wrapper,
+  );
+}
+```
+
+### Injectable instantiation
+
+```ts packages/core/injector/instance-loader.ts
+private async createInstancesOfInjectables(moduleRef: Module) {
+  const { injectables } = moduleRef;
+  const wrappers = [...injectables.values()];
+  await Promise.all(
+    wrappers.map(async item => {
+      await this.injector.loadInjectable(item, moduleRef);
+      this.graphInspector.inspectInstanceWrapper(item, moduleRef);
+    }),
+  );
+}
+```
+
+`injector.loadInjectable` delegates directly to `loadInstance` without enhancer loading, because enhancers are already attached to their host providers or controllers during the scan phase.
+
+```ts packages/core/injector/injector.ts
+public async loadInjectable<T = any>(
+  wrapper: InstanceWrapper<T>,
+  moduleRef: Module,
+  contextId = STATIC_CONTEXT,
+  inquirer?: InstanceWrapper,
+) {
+  const injectables = moduleRef.injectables;
+  await this.loadInstance<T>(
+    wrapper,
+    injectables,
+    moduleRef,
+    this.createResolutionContext(contextId, inquirer),
+  );
+}
+```
+
+### Controller instantiation
+
+```ts packages/core/injector/instance-loader.ts
+private async createInstancesOfControllers(moduleRef: Module) {
+  const { controllers } = moduleRef;
+  const wrappers = [...controllers.values()];
+  await Promise.all(
+    wrappers.map(async item => {
+      await this.injector.loadController(item, moduleRef);
+      this.graphInspector.inspectInstanceWrapper(item, moduleRef);
+    }),
+  );
+}
+```
+
+Like providers, controllers get their enhancers loaded after `loadInstance`.
+
+```ts packages/core/injector/injector.ts
+public async loadController(
+  wrapper: InstanceWrapper<Controller>,
+  moduleRef: Module,
+  contextId = STATIC_CONTEXT,
+) {
+  const controllers = moduleRef.controllers;
+  await this.loadInstance<Controller>(
+    wrapper,
+    controllers,
+    moduleRef,
+    this.createResolutionContext(contextId, wrapper),
+  );
+  await this.loadEnhancersPerContext(wrapper, contextId, wrapper);
+}
+```
+
+## Circular dependency detection with `SettlementSignal`
+
+Although `InstanceLoader` does not import `SettlementSignal` directly, the `Injector` methods it calls rely on it for async resolution safety and circular dependency detection. When `loadInstance` starts resolving a wrapper, it applies a `SettlementSignal` to the `InstancePerContext` host.
+
+```ts packages/core/injector/injector.ts
+public applySettlementSignal<T>(
+  instancePerContext: InstancePerContext<T>,
+  host: InstanceWrapper<T>,
+) {
+  const settlementSignal = new SettlementSignal();
+  instancePerContext.donePromise = settlementSignal.asPromise();
+  instancePerContext.isPending = true;
+  host.settlementSignal = settlementSignal;
+
+  return settlementSignal;
+}
+```
+
+If another provider in the same dependency graph tries to resolve the same wrapper before it is finished, `loadInstance` sees `isPending === true`, checks for a cycle via `settlementSignal.isCycle`, and either:
+
+- Waits for the `donePromise` if there is no cycle.
+- Throws `CircularDependencyException` if the inquirer already depends on this wrapper.
+
+This mechanism is what makes Nest's constructor dependency injection safe even when providers reference each other transitively.
+
+## `TopologyTree` and instance loading
+
+The `TopologyTree` is not used by `InstanceLoader` itself. It is constructed earlier by `DependenciesScanner.calculateModulesDistance` to assign a `distance` value to every module for lifecycle hook ordering. `InstanceLoader` iterates the flat `ModulesContainer` map directly, so instantiation order is determined by `Map` insertion order (which follows registration order) rather than by the topology tree.
+
+## Graph inspector hooks
+
+After every provider, injectable, and controller is resolved, `InstanceLoader` calls `graphInspector.inspectInstanceWrapper`. Once all modules finish, it calls `graphInspector.inspectModules`. These hooks populate the serialized dependency graph that is available for diagnostics and the preview inspector.
+
+## Source files
+
+| Path | Role |
+| --- | --- |
+| `packages/core/injector/instance-loader.ts` | `InstanceLoader`: orchestrates the two-phase instantiation pipeline. |
+| `packages/core/injector/injector.ts` | `Injector`: resolves constructor parameters, loads instances, manages `SettlementSignal`. |
+| `packages/core/injector/settlement-signal.ts` | `SettlementSignal`: async completion token with circular-dependency cycle detection. |
+| `packages/core/injector/instance-wrapper.ts` | `InstanceWrapper`: holds the prototype and resolved instance per context. |
+| `packages/core/inspector/graph-inspector.ts` | `GraphInspector`: records resolved wrappers and modules for diagnostics. |
+
+## Related pages
+
+- [DependenciesiesScanner](/di/dependency-scanner)
+- [Modules and Container](/di/modules-and-container)
+- [Injector](/di/injector)
